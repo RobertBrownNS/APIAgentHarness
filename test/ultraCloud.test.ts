@@ -199,7 +199,7 @@ describe("everyday infrastructure commands stay allowed", () => {
 });
 
 describe("known gaps (it.fails until fixed)", () => {
-  it.fails("mounting a single file under a system folder (docker run -v /etc/passwd:/p) asks (GAP: only folders are matched)", () => {
+  it("mounting a single file under a system folder (docker run -v /etc/passwd:/p) asks", () => {
     askBoth("docker run -v /etc/passwd:/p ubuntu");
   });
 });

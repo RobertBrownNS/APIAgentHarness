@@ -1320,7 +1320,7 @@ function cloudDestroyRule(word: string, args: string[], lower: string[]): string
           else if (/^-v./.test(args[i])) v = args[i].slice(2);
           if (v === undefined) continue;
           const src = /(?:^|,)(?:src|source)=([^,]+)/i.exec(v)?.[1] ?? v;
-          if (/^(\/|[A-Za-z]:[\\/]?)(:|$)/.test(src) || /^\/(etc|root|home|var|usr|bin|sys|proc|dev|boot|lib)?(:|$)/.test(src)) {
+          if (/^(\/|[A-Za-z]:[\\/]?)(:|$)/.test(src) || /^\/home(:|$)/.test(src) || /^\/(etc|root|var|usr|bin|sbin|sys|proc|dev|boot|lib|lib64)(\/|:|$)/.test(src) || /^[A-Za-z]:[\\/](windows|program files( \(x86\))?|programdata)([\\/]|:|$)/i.test(src)) {
             return `${word} run mounts the host's root or system folders`;
           }
           if (/\/var\/run\/docker\.sock/.test(v)) return `${word} run mounts the container socket`;
