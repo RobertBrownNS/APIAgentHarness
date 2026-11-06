@@ -610,7 +610,11 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
 
   // Paths that leave the workspace.
   for (const a of t.slice(1)) {
-    if (a.split(/[\\/]/).includes("..")) return { v: "ask", rule: "path leaves the workspace (..)" };
+    // `..` is fine while the resolved path stays inside the workspace (src/../README.md, ../x after cd sub).
+    const dd = a.startsWith("-") && a.includes("=") ? a.slice(a.indexOf("=") + 1) : a;
+    if (dd.split(/[\\/]/).includes("..") && !isInside(path.resolve(cwd, dd), root)) {
+      return { v: "ask", rule: "path leaves the workspace (..)" };
+    }
     if (/^~/.test(a)) return { v: "ask", rule: "home directory (~)" };
     const val = a.includes("=") ? a.slice(a.indexOf("=") + 1) : a;
     if (/^\/[A-Za-z?]$/.test(a)) continue; // cmd-style switch such as /s (a bare argument, not an option value)
@@ -618,7 +622,6 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
       return { v: "ask", rule: "path outside the workspace" };
     }
   }
-  if (word === "cd" && args.some((a) => a === ".." || a.startsWith("..") )) return { v: "ask", rule: "cd leaves the workspace" };
 
   // A glob that matches a secrets file in the folder is a secrets read (cat .e*, type id_*, grep x cred*).
   if (t.slice(1).some((a) => /[*?[]/.test(a) && globTouchesSecret(a, cwd))) return { v: "ask", rule: "glob matches a secrets file" };
