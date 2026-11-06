@@ -5,6 +5,7 @@ import type { ApprovalDecision, ApprovalRequest } from "../src/shared/protocol";
 const sig = () => new AbortController();
 const req = (id: string, agent = "lead", coverable = false): ApprovalRequest => ({
   id,
+  kind: "tool",
   agent,
   tool: coverable ? "edit_file" : "run_command",
   input: {},

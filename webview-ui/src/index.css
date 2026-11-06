@@ -118,3 +118,57 @@
 .markdown table { display: block; overflow-x: auto; border-collapse: collapse; max-width: 100%; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 0.25em 0.5em; }
 .markdown hr { border: 0; border-top: 1px solid var(--border); margin: 0.8em 0; }
+
+/* Utilities the shadcn AI components expect. */
+@utility shimmer {
+  animation: shimmer-pulse 1.6s ease-in-out infinite;
+}
+@utility scroll-fade-x {
+  scrollbar-width: thin;
+}
+@utility scroll-fade-y {
+  scrollbar-width: thin;
+}
+@utility scroll-fade-b {
+  scrollbar-width: thin;
+}
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+}
+@utility scrollbar-gutter-stable {
+  scrollbar-gutter: stable;
+}
+@keyframes shimmer-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+@keyframes collapsible-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height);
+  }
+}
+@keyframes collapsible-up {
+  from {
+    height: var(--radix-collapsible-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+@theme inline {
+  --animate-accordion-down: collapsible-down 0.2s ease-out;
+  --animate-accordion-up: collapsible-up 0.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+  }
+}

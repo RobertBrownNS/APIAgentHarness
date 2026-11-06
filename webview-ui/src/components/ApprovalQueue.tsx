@@ -1,13 +1,15 @@
 import type { ApprovalRequest, ChatItem } from "@shared/protocol";
-import { Badge } from "@/components/ui/badge";
-import { ApprovalCard } from "@/components/ApprovalCard";
-import { ToolCallCard } from "@/components/ToolCallCard";
+import { Button } from "@/components/ui/button";
+import { Confirmation } from "@/components/Confirmation";
+import { PlanCard } from "@/components/PlanCard";
 
 export function ApprovalQueue({
   approvals,
+  transcripts,
   onSelectAgent,
 }: {
   approvals: ApprovalRequest[];
+  transcripts: Record<string, ChatItem[]>;
   onSelectAgent: (name: string) => void;
 }) {
   if (approvals.length === 0) {
@@ -16,24 +18,16 @@ export function ApprovalQueue({
   return (
     <ul className="flex flex-col gap-2 p-2">
       {approvals.map((r) => {
-        const item: Extract<ChatItem, { kind: "tool" }> = {
-          kind: "tool",
-          id: r.id,
-          name: r.tool,
-          input: r.input,
-          status: "awaiting",
-        };
+        const plan =
+          r.kind === "plan"
+            ? (transcripts[r.agent] ?? []).find((it): it is Extract<ChatItem, { kind: "plan" }> => it.kind === "plan" && it.id === r.id)
+            : undefined;
         return (
           <li key={r.id} className="min-w-0 space-y-1">
-            <button
-              type="button"
-              onClick={() => onSelectAgent(r.agent)}
-              className="cursor-pointer text-left"
-              title={`Open ${r.agent}'s chat`}
-            >
-              <Badge variant="warning" className="text-xs">{r.agent} wants to run {r.tool}</Badge>
-            </button>
-            <ToolCallCard item={item} footer={<ApprovalCard id={r.id} agent={r.agent} allowApproveAll={r.coverable} />} />
+            {plan ? <PlanCard item={plan} /> : <Confirmation request={r} />}
+            <Button variant="link" size="xs" className="h-auto p-0" onClick={() => onSelectAgent(r.agent)}>
+              Open {r.agent}&apos;s chat
+            </Button>
           </li>
         );
       })}

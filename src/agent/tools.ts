@@ -2,6 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { spawn } from "node:child_process";
 import * as vscode from "vscode";
 import { z } from "zod";
+import { isSecretEither } from "./secretPaths";
 import { confinePath, displayPath } from "./paths";
 import { findMatches, looksBinary, numberLines, replaceUnique, truncateMiddle } from "./textOps";
 
@@ -150,6 +151,10 @@ export async function runTool(name: string, input: unknown, ctx: ToolContext): P
   }
 }
 
+function hiddenNote(n: number): string {
+  return n > 0 ? `\n(${n} secret file${n === 1 ? "" : "s"} hidden; use read_file to request access)` : "";
+}
+
 /** Globs must stay inside the workspace: no absolute paths and no ".." segments. */
 function checkGlob(glob: string | undefined): string {
   const g = glob ?? "**/*";
@@ -192,19 +197,25 @@ async function readFile(input: z.infer<typeof schemas.read_file>, ctx: ToolConte
 async function listFiles(input: z.infer<typeof schemas.list_files>, ctx: ToolContext): Promise<string> {
   const pattern = new vscode.RelativePattern(ctx.root, checkGlob(input.glob));
   const uris = await vscode.workspace.findFiles(pattern, EXCLUDE, 500);
+  let hidden = 0;
   const paths = uris
     .filter((u) => {
       try {
         confinePath(ctx.root, u.fsPath);
-        return true;
       } catch {
         return false;
       }
+      if (isSecretEither(u.fsPath, ctx.root)) {
+        hidden++;
+        return false;
+      }
+      return true;
     })
     .map((u) => displayPath(ctx.root, u.fsPath))
     .sort();
-  if (paths.length === 0) return "No files matched.";
-  return paths.join("\n") + (paths.length === 500 ? "\n... (stopped at 500 results; narrow the glob)" : "");
+  const note = hiddenNote(hidden);
+  if (paths.length === 0) return `No files matched.${note}`;
+  return paths.join("\n") + (paths.length === 500 ? "\n... (stopped at 500 results; narrow the glob)" : "") + note;
 }
 
 async function searchText(input: z.infer<typeof schemas.search_text>, ctx: ToolContext): Promise<string> {
@@ -221,11 +232,16 @@ async function searchText(input: z.infer<typeof schemas.search_text>, ctx: ToolC
   const MAX_LINE = 2000; // long lines are where backtracking regexes blow up
   const deadline = Date.now() + 10_000;
   let timedOut = false;
+  let hidden = 0;
   for (const uri of uris) {
     if (ctx.signal.aborted || results.length >= MAX) break;
     if (Date.now() > deadline) {
       timedOut = true;
       break;
+    }
+    if (isSecretEither(uri.fsPath, ctx.root)) {
+      hidden++;
+      continue;
     }
     let bytes: Uint8Array;
     try {
@@ -247,8 +263,9 @@ async function searchText(input: z.infer<typeof schemas.search_text>, ctx: ToolC
       results.push(`${rel}:${m.line}: ${m.text}`);
     }
   }
-  if (results.length === 0) return "No matches.";
-  return results.join("\n") + (results.length >= MAX ? `\n... (stopped at ${MAX} matches)` : "");
+  const note = hiddenNote(hidden);
+  if (results.length === 0) return `No matches.${note}`;
+  return results.join("\n") + (results.length >= MAX ? `\n... (stopped at ${MAX} matches)` : "") + note;
 }
 
 /** Apply an edit through VS Code so it shows in open editors and can be undone. */

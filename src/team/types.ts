@@ -1,5 +1,51 @@
 // Interfaces shared between the team modules. Owner: manager (propose changes in TEAMS.md).
-import type { AgentInfo, ApprovalRequest, ChatItem, Effort, TaskStatus, TeamTask } from "../shared/protocol";
+import type { AgentInfo, ApprovalRequest, ChatItem, Effort, Mode, TaskStatus, TeamTask } from "../shared/protocol";
+
+/** Result of TeamContext.authorize for a file/command tool call. */
+export interface Authorization {
+  approved: boolean;
+  /** Why it was refused (user's reason, "stopped", or the Plan-mode explanation). Goes into the tool_result. */
+  reason?: string;
+  /** Auto mode approved it without asking; short explanation shown on the tool card. */
+  autoApproved?: string;
+  /** Set when the current mode forbids the tool (Plan mode). */
+  blockedByMode?: Mode;
+}
+
+/** Input to the Auto-mode safety check for a command. */
+export interface CommandCheck {
+  command: string;
+  /** Absolute working directory (the workspace root today). */
+  cwd: string;
+  root: string;
+  agent: string;
+  /** For `npm|pnpm|yarn run <script>`: the script body from package.json, shown to the classifier as untrusted data. */
+  scriptBody?: string;
+}
+
+/**
+ * Auto-mode safety check (implemented in src/agent/classifier.ts with claude-haiku-5-5, injected into Team).
+ * Must never throw: on any failure resolve { verdict: "ask", reason: "safety check unavailable: …" }.
+ */
+export type CommandClassifier = (
+  check: CommandCheck,
+  signal: AbortSignal,
+) => Promise<{
+  verdict: "allow" | "ask";
+  reason: string;
+  usage?: { input: number; output: number; uncachedInput: number; cacheRead: number; cacheWrite: number };
+}>;
+
+/**
+ * Pure Auto-mode rules (src/team/autoPolicy.ts, no vscode/SDK imports). Allowlist-first (TEAMS.md R3 decisions):
+ *   checkCommand(command, root, ctx: { written: ReadonlySet<string>; scriptBody?: (name: string) => string | undefined }):
+ *     { verdict: "allow"; rule: string }      // recognised safe command, no expansion metacharacters
+ *   | { verdict: "classify"; scriptBody?: string } // send to the classifier (never for anything with expansion chars)
+ *   | { verdict: "ask"; rule: string }         // hard rule, expansion chars, runs a file written this session, inline code…
+ *   isSensitivePath(absPath, root): boolean   // Windows-normalised; such edits always ask and are never coverable
+ *   checkEdit(absPath, root): { verdict: "ask"; rule: string } | { verdict: "allow" }
+ * The classifier can only turn "classify" into allow/ask; it never overrides "ask".
+ */
 
 // Team tool definitions + executors live in teamTools.ts (owner: core) and export:
 //   teamToolDefinitions(isLead: boolean): Anthropic.Beta.BetaTool[]
@@ -79,6 +125,41 @@ export interface TeamContext {
   roster(): AgentInfo[];
   /** Serialise edits to the same file across agents. */
   withFileLock<T>(absPath: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
+  /** Current team-wide mode. */
+  readonly mode: Mode;
+  /**
+   * The single gate loop.ts calls before running edit_file / write_file / run_command (instead of approvals.request).
+   * plan → refused (blockedByMode). normal → approval queue (approve-all coverage for edits).
+   * auto → autoPolicy hard rules (ask with askReason) → edits allowed / commands to the classifier (allow or ask).
+   * Read tools never call this unless autoApproveReads is off (then: normal/plan ask, auto allows).
+   * `absPath` is the confined target for edit/write. Team records every path an agent writes (for the written-file rule).
+   */
+  authorize(
+    req: { id: string; agent: string; tool: string; input: unknown; absPath?: string },
+    signal: AbortSignal,
+  ): Promise<Authorization>;
+  /**
+   * Re-check the CURRENT mode immediately before running a file/command tool (after approval, classifier and lock waits).
+   * Closes races: approved in Normal then switched to Plan; batch authorized then mode changed; late classifier verdict.
+   */
+  canRun(
+    tool: string,
+    agent: string,
+    /** tool_use id: lets Team refuse a call Auto approved once the mode is no longer Auto. */
+    callId?: string,
+  ): { ok: true } | { ok: false; reason: string; blockedByMode: Mode };
+  /** Called by loop after a successful edit_file/write_file so autoPolicy can apply the written-file rule. */
+  recordWrite(agent: string, absPath: string): void;
+  /**
+   * Notes the agent must send as a mid-conversation `{role: "system"}` message right after its next user message
+   * (tool_results or text), e.g. "Mode changed to Plan: …". Drained (removed) by the call.
+   */
+  drainSystemNotes(agent: string): string[];
+  /** Main only, Plan mode only (present_plan tool): show the plan and wait for the user's decision. */
+  presentPlan(
+    req: { id: string; agent: string; title: string; summary: string; steps: { title: string; detail?: string }[] },
+    signal: AbortSignal,
+  ): Promise<{ approved: boolean; mode?: "normal" | "auto"; feedback?: string }>;
   /** Count an automatic (mail-triggered) turn. Returns false when the team's auto-turn budget is spent. */
   takeAutoTurn(agent: string): boolean;
   /**

@@ -1,8 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as vscode from "vscode";
-import type { AgentInfo, AgentStatus, ChatItem, Effort } from "../shared/protocol";
-import type { AgentEvents, AgentHandle, AgentOptions, TeamContext } from "../team/types";
+import type { AgentInfo, AgentStatus, ChatItem, Effort, Mode } from "../shared/protocol";
+import type { AgentEvents, AgentHandle, AgentOptions, Authorization, TeamContext } from "../team/types";
 import { isTeamTool, runTeamTool, teamToolDefinitions } from "../team/teamTools";
+import { appendUserTurn, systemNotesToText } from "./history";
+import { globNamesSecrets } from "../team/autoPolicy";
+import { isSecretEither, pathForAuthorize } from "./secretPaths";
 import { createClient } from "./client";
 import { confinePath } from "./paths";
 import { buildLeadPrompt, buildTeammatePrompt } from "./systemPrompt";
@@ -41,10 +44,23 @@ const MAX_UI_OUTPUT = 20_000;
 const MAX_RETRIES = 2;
 const INPUT_UPDATE_MS = 100;
 
+function cfgGet<T>(key: string, def: T): T {
+  return vscode.workspace.getConfiguration("nextAgent").get<T>(key, def);
+}
+
 function clip(s: string): string {
   return s.length > MAX_UI_OUTPUT
     ? `${s.slice(0, MAX_UI_OUTPUT)}\n... (${s.length - MAX_UI_OUTPUT} more characters not shown)`
     : s;
+}
+
+class ModeBlocked extends Error {
+  constructor(
+    message: string,
+    readonly mode: Mode,
+  ) {
+    super(message);
+  }
 }
 
 /** One team member: message history sent to the API plus the transcript shown in the panel. */
@@ -67,6 +83,8 @@ export class AgentSession implements AgentHandle {
   private pendingApprovals = 0;
   private outputTokens = 0;
   private inputTokens = 0;
+  private contextTokens = 0;
+  private notesAsText = false;
   private turnErrored = false;
   private errorText = "";
   private lastText = "";
@@ -106,8 +124,18 @@ export class AgentSession implements AgentHandle {
       spawnedBy: this.spawnedBy,
       outputTokens: this.outputTokens,
       inputTokens: this.inputTokens,
+      contextTokens: this.contextTokens,
       pendingMail: this.pendingMailSafe(),
     };
+  }
+
+  /** Queued notes (e.g. mode changes) to send as system messages right after the next user message. */
+  private drainNotes(): string[] {
+    try {
+      return this.team.drainSystemNotes(this.name);
+    } catch {
+      return [];
+    }
   }
 
   private pendingMailSafe(): number {
@@ -225,28 +253,18 @@ export class AgentSession implements AgentHandle {
       const base = await createClient(runtime.secrets);
       const client = base?.withOptions({ maxRetries: 5 }); // parallel agents hit 429/529 more often
       if (!client) {
-        this.notice("error", "No API key found. Run 'Agent Harness: Set API Key'.");
+        this.notice("error", "No API key found. Run 'NextAgent: Set API Key'.");
         return this.result(abort);
       }
       if (abort.signal.aborted) return this.result(abort);
 
-      // Merge into a trailing user message (after Stop or an API error) to keep roles alternating.
-      const last = msgs[msgs.length - 1];
-      if (last && last.role === "user") {
-        const blocks: Anthropic.Beta.BetaContentBlockParam[] =
-          typeof last.content === "string" ? [{ type: "text", text: last.content }] : [...last.content];
-        blocks.push({ type: "text", text });
-        last.content = blocks;
-      } else {
-        msgs.push({ role: "user", content: text });
-      }
+      appendUserTurn(msgs, text, this.drainNotes(), this.notesAsText); // merges into a trailing user message after Stop or an API error
 
-      const cfg = vscode.workspace.getConfiguration("agentHarness");
       const settings: Settings = {
-        maxTokens: cfg.get<number>("maxTokens", 64000),
-        autoApproveReads: cfg.get<boolean>("autoApproveReads", true),
-        commandTimeoutSec: cfg.get<number>("commandTimeoutSec", 120),
-        refusalFallback: cfg.get<boolean>("refusalFallback", true),
+        maxTokens: cfgGet<number>("maxTokens", 64000),
+        autoApproveReads: cfgGet<boolean>("autoApproveReads", true),
+        commandTimeoutSec: cfgGet<number>("commandTimeoutSec", 120),
+        refusalFallback: cfgGet<boolean>("refusalFallback", true),
       };
       const root = this.team.root;
       const system = this.isLead
@@ -278,7 +296,7 @@ export class AgentSession implements AgentHandle {
     if (err instanceof Anthropic.APIUserAbortError || signal.aborted) return;
     this.log(`[error] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     if (err instanceof Anthropic.AuthenticationError) {
-      this.notice("error", "Invalid API key. Run 'Agent Harness: Set API Key'.");
+      this.notice("error", "Invalid API key. Run 'NextAgent: Set API Key'.");
     } else if (err instanceof Anthropic.RateLimitError) {
       this.notice("error", "Rate limited by the API. This agent's turn ended; send it a message to continue.");
     } else if (err instanceof Anthropic.APIError) {
@@ -299,14 +317,14 @@ export class AgentSession implements AgentHandle {
     const tools = [...toolDefinitions, ...teamToolDefinitions(this.isLead)];
     let retries = 0;
 
-    const cfgMax = vscode.workspace.getConfiguration("agentHarness").get<number>("maxTurnIterations", 40);
+    const cfgMax = cfgGet<number>("maxTurnIterations", 40);
     const maxIter = Number.isFinite(cfgMax) && cfgMax > 0 ? cfgMax : 40;
     let iter = 0;
     while (!signal.aborted) {
       if (iter++ >= maxIter) {
         this.lastText = `${this.lastText}
 (turn stopped at the iteration limit; work may be incomplete)`.trim();
-        this.notice("info", `Stopped after ${maxIter} model calls in one turn (agentHarness.maxTurnIterations).`);
+        this.notice("info", `Stopped after ${maxIter} model calls in one turn (nextAgent.maxTurnIterations).`);
         return;
       }
       // Content block index -> UI item. Text/thinking items are created on the first delta so none are empty.
@@ -372,7 +390,17 @@ export class AgentSession implements AgentHandle {
         message = await stream.finalMessage();
       } catch (err) {
         if (signal.aborted || err instanceof Anthropic.APIUserAbortError) return;
-        if (err instanceof Anthropic.APIError) throw err;
+        if (err instanceof Anthropic.APIError) {
+          // Safety net: if the API rejects mid-conversation system messages, send notes as text from now on.
+          if (err.status === 400 && !this.notesAsText && /system/i.test(err.message)) {
+            this.notesAsText = true; // once only; a repeat 400 is reported as an error
+            if (systemNotesToText(msgs) > 0) {
+              this.log("[notes] API rejected role:system messages; falling back to text notes");
+              continue;
+            }
+          }
+          throw err;
+        }
         // Only the unparseable-tool-input case is retried; anything else is a real bug.
         const unparseable = err instanceof SyntaxError || /json/i.test(err instanceof Error ? err.message : "");
         if (unparseable && retries < MAX_RETRIES) {
@@ -392,6 +420,7 @@ export class AgentSession implements AgentHandle {
       this.outputTokens += u.output_tokens ?? 0;
       const inTok = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
       this.inputTokens += inTok;
+      this.contextTokens = inTok;
       const withinBudget = this.team.recordUsage(this.name, {
         input: inTok,
         output: u.output_tokens ?? 0,
@@ -435,7 +464,7 @@ export class AgentSession implements AgentHandle {
         // Not appended: it holds tool_use blocks that would need results.
         this.notice(
           "error",
-          "The response was cut off (max tokens reached) before the tool call finished. Try again or raise agentHarness.maxTokens.",
+          "The response was cut off (max tokens reached) before the tool call finished. Try again or raise nextAgent.maxTokens.",
         );
         return;
       }
@@ -455,12 +484,12 @@ export class AgentSession implements AgentHandle {
           this.updateTool(tu.id, { status: "error", output: "Not run: team budget reached." });
           return { type: "tool_result", tool_use_id: tu.id, content: "Not run: the team budget was reached.", is_error: true };
         });
-        msgs.push({ role: "user", content: stub });
+        appendUserTurn(msgs, stub, this.drainNotes(), this.notesAsText);
         this.notice("info", "Team budget reached; this turn ended.");
         return;
       }
       const results = await this.runTools(run, toolUses, s);
-      msgs.push({ role: "user", content: results });
+      appendUserTurn(msgs, results, this.drainNotes(), this.notesAsText);
     }
   }
 
@@ -486,19 +515,44 @@ export class AgentSession implements AgentHandle {
           parseError = e instanceof ToolError ? e.message : String(e);
         }
       }
-      const needsApproval = !teamTool && !parseError && !signal.aborted && (MUTATING.has(tu.name) || !s.autoApproveReads);
-      let approval: Promise<{ approved: boolean; reason?: string }> | undefined;
+      // Reads of secret files (.env, keys, .ssh ...) always go through authorize, even with autoApproveReads on.
+      let secretRead = false;
+      if (!teamTool && !parseError) {
+        const inp = input as { path?: string; glob?: string };
+        if (tu.name === "read_file" && typeof inp.path === "string") {
+          try {
+            secretRead = isSecretEither(confinePath(root, inp.path), root);
+          } catch {
+            /* runTool reports the path error */
+          }
+        } else if ((tu.name === "list_files" || tu.name === "search_text") && globNamesSecrets(inp.glob)) {
+          secretRead = true;
+        }
+      }
+      const needsApproval =
+        !teamTool && !parseError && !signal.aborted && (MUTATING.has(tu.name) || !s.autoApproveReads || secretRead);
+      let approval: Promise<Authorization> | undefined;
       if (needsApproval) {
-        this.updateTool(tu.id, { status: "awaiting" });
-        this.pendingApprovals++;
-        this.emitInfo();
-        approval = this.team.approvals
-          .request(
-            { id: tu.id, agent: this.name, tool: tu.name, input, coverable: tu.name === "edit_file" || tu.name === "write_file" },
-            signal,
-          )
-          .catch(() => ({ approved: false, reason: "stopped" }))
+        // In Auto mode most calls are decided without the user, so only other modes show "awaiting" up front.
+        const showAwaiting = this.team.mode !== "auto";
+        if (showAwaiting) {
+          this.updateTool(tu.id, { status: "awaiting" });
+          this.pendingApprovals++;
+          this.emitInfo();
+        }
+        let absPath: string | undefined;
+        if (tu.name === "edit_file" || tu.name === "write_file" || tu.name === "read_file") {
+          try {
+            absPath = pathForAuthorize(confinePath(root, (input as { path: string }).path), root);
+          } catch {
+            /* runTool reports the path error */
+          }
+        }
+        approval = this.team
+          .authorize({ id: tu.id, agent: this.name, tool: tu.name, input, absPath }, signal)
+          .catch((): Authorization => ({ approved: false, reason: "stopped" }))
           .finally(() => {
+            if (!showAwaiting) return;
             this.pendingApprovals = Math.max(0, this.pendingApprovals - 1);
             this.emitInfo();
           });
@@ -523,9 +577,19 @@ export class AgentSession implements AgentHandle {
       if (approval) {
         const decision = await approval;
         if (!decision.approved) {
+          if (decision.blockedByMode) {
+            this.updateTool(tu.id, { blockedByMode: decision.blockedByMode });
+            results.push(fail(decision.reason ?? `Refused: the team is in ${decision.blockedByMode} mode.`, "rejected"));
+            continue;
+          }
           const why = decision.reason ? `: ${decision.reason}` : "";
           results.push(fail(`The user rejected this action${why}`, "rejected"));
           continue;
+        }
+        if (decision.autoApproved) {
+          this.updateTool(tu.id, { autoApproved: decision.autoApproved });
+          const what = tu.name === "run_command" ? String((input as { command?: string }).command ?? "").slice(0, 200) : tu.name;
+          this.log(`[auto] ${what} — ${decision.autoApproved}`);
         }
         if (signal.aborted) {
           results.push(fail("Stopped by user"));
@@ -535,25 +599,41 @@ export class AgentSession implements AgentHandle {
       this.updateTool(tu.id, { status: "running" });
       try {
         const out = teamTool
-          ? await runTeamTool(tu.name, input, { self: this.name, isLead: this.isLead, team: this.team })
-          : await this.runFileOrCommand(tu.name, input, root, signal, s);
+          ? await runTeamTool(tu.name, input, {
+              self: this.name,
+              isLead: this.isLead,
+              team: this.team,
+              toolUseId: tu.id,
+              signal,
+            })
+          : await this.runFileOrCommand(tu.name, input, root, signal, s, tu.id);
         this.updateTool(tu.id, { status: "done", output: clip(out) });
         results.push({ type: "tool_result", tool_use_id: tu.id, content: out });
       } catch (e) {
+        if (e instanceof ModeBlocked) {
+          this.updateTool(tu.id, { blockedByMode: e.mode });
+          results.push(fail(e.message, "rejected"));
+          continue;
+        }
         results.push(fail(e instanceof Error ? e.message : String(e)));
       }
     }
     return results;
   }
 
-  private runFileOrCommand(name: string, input: unknown, root: string, signal: AbortSignal, s: Settings): Promise<string> {
-    const exec = () =>
-      runTool(name, input, {
+  private runFileOrCommand(name: string, input: unknown, root: string, signal: AbortSignal, s: Settings, callId: string): Promise<string> {
+    const exec = () => {
+      if (MUTATING.has(name)) {
+        const gate = this.team.canRun(name, this.name, callId);
+        if (!gate.ok) throw new ModeBlocked(gate.reason, gate.blockedByMode);
+      }
+      return runTool(name, input, {
         root,
         signal,
         commandTimeoutSec: s.commandTimeoutSec,
         output: runtime!.output,
       });
+    };
     if (name !== "edit_file" && name !== "write_file") return exec();
     // Serialise writes to the same file across agents.
     let abs: string;
@@ -562,6 +642,14 @@ export class AgentSession implements AgentHandle {
     } catch {
       return exec(); // runTool reports the path error itself
     }
-    return this.team.withFileLock(abs, exec, signal);
+    return this.team.withFileLock(
+      abs,
+      async () => {
+        const out = await exec();
+        this.team.recordWrite(this.name, abs);
+        return out;
+      },
+      signal,
+    );
   }
 }

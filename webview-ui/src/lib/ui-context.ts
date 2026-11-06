@@ -1,4 +1,11 @@
 import { createContext } from "react";
+import type { ApprovalRequest } from "@shared/protocol";
 
-/** Lets a chat tool card jump to the approval queue (switches tab in the narrow layout). */
-export const ShowQueueContext = createContext<() => void>(() => {});
+export interface ApprovalsCtx {
+  /** Solo layout: approvals render inline in the chat. Team layout: they live in the shared queue. */
+  inline: boolean;
+  byId: Record<string, ApprovalRequest>;
+  showQueue: () => void;
+}
+
+export const ApprovalsContext = createContext<ApprovalsCtx>({ inline: false, byId: {}, showQueue: () => {} });

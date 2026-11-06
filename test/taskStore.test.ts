@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskError, TaskStoreImpl } from "../src/team/taskStore";
 
 let s: TaskStoreImpl;
-const mk = (subject = "t", blockedBy?: string[]) => s.create({ subject, description: "d", blockedBy, createdBy: "lead" });
+const mk = (subject = "t", blockedBy?: string[]) => s.create({ subject, description: "d", blockedBy, createdBy: "main" });
 beforeEach(() => {
   s = new TaskStoreImpl();
 });
@@ -12,7 +12,7 @@ describe("create/get/list", () => {
     const a = mk(),
       b = mk();
     expect([a.id, b.id]).toEqual(["1", "2"]);
-    expect(a).toMatchObject({ status: "pending", blockedBy: [], notes: [], createdBy: "lead" });
+    expect(a).toMatchObject({ status: "pending", blockedBy: [], notes: [], createdBy: "main" });
     expect(a.owner).toBeUndefined();
   });
   it("returns copies, not live objects", () => {
@@ -30,7 +30,7 @@ describe("create/get/list", () => {
   });
   it("blockedBy on a completed task is dropped; duplicates deduped", () => {
     mk();
-    s.update("1", { status: "completed" }, "lead");
+    s.update("1", { status: "completed" }, "main");
     expect(mk("b", ["1"]).blockedBy).toEqual([]);
     mk("c");
     expect(mk("d", ["3", "3"]).blockedBy).toEqual(["3"]);
@@ -63,7 +63,7 @@ describe("claim rules", () => {
   });
   it("a third party cannot steal by setting owner only", () => {
     mk();
-    s.update("1", { owner: "bob" }, "lead");
+    s.update("1", { owner: "bob" }, "main");
     expect(() => s.update("1", { owner: "amy" }, "amy")).toThrow(TaskError);
     expect(s.get("1")!.owner).toBe("bob");
   });
@@ -83,7 +83,7 @@ describe("claim rules", () => {
   it("decision 7: lead bypasses the owner check", () => {
     mk();
     s.update("1", { owner: "bob", status: "in_progress" }, "bob");
-    expect(s.update("1", { owner: "amy" }, "lead").owner).toBe("amy");
+    expect(s.update("1", { owner: "amy" }, "main").owner).toBe("amy");
   });
   it("owner re-claiming own in-progress task is fine", () => {
     mk();
@@ -114,7 +114,7 @@ describe("completion and dependencies", () => {
     mk();
     mk("b", ["1"]);
     mk("c", ["1"]);
-    s.update("1", { status: "completed" }, "lead");
+    s.update("1", { status: "completed" }, "main");
     expect(s.get("2")!.blockedBy).toEqual([]);
     expect(s.get("3")!.blockedBy).toEqual([]);
   });
@@ -122,15 +122,15 @@ describe("completion and dependencies", () => {
     mk();
     mk();
     mk("c", ["1", "2"]);
-    s.update("1", { status: "completed" }, "lead");
+    s.update("1", { status: "completed" }, "main");
     expect(s.get("3")!.blockedBy).toEqual(["2"]);
-    s.update("2", { status: "completed" }, "lead");
+    s.update("2", { status: "completed" }, "main");
     expect(s.get("3")!.blockedBy).toEqual([]);
   });
   it("unblocked task can then be claimed", () => {
     mk();
     mk("b", ["1"]);
-    s.update("1", { status: "completed" }, "lead");
+    s.update("1", { status: "completed" }, "main");
     expect(() => s.update("2", { owner: "bob", status: "in_progress" }, "bob")).not.toThrow();
   });
   it("addBlockedBy unknown id throws", () => {
@@ -157,7 +157,7 @@ describe("completion and dependencies", () => {
     mk();
     mk();
     mk("c", ["1"]);
-    s.update("2", { status: "completed" }, "lead");
+    s.update("2", { status: "completed" }, "main");
     s.update("3", { addBlockedBy: ["2", "1"] }, "bob");
     expect(s.get("3")!.blockedBy).toEqual(["1"]);
   });
@@ -166,7 +166,7 @@ describe("completion and dependencies", () => {
     mk("b", ["1"]);
     mk("c", ["1"]);
     mk("d", ["2", "3"]);
-    for (const id of ["1", "2", "3"]) s.update(id, { status: "completed" }, "lead");
+    for (const id of ["1", "2", "3"]) s.update(id, { status: "completed" }, "main");
     expect(s.get("4")!.blockedBy).toEqual([]);
   });
 });

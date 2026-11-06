@@ -1,4 +1,4 @@
-import type { TaskStatus, TeamTask } from "../shared/protocol";
+import { LEAD, type TaskStatus, type TeamTask } from "../shared/protocol";
 import type { TaskStore } from "./types";
 
 /** Thrown with a message suitable for showing to the model. */
@@ -6,8 +6,7 @@ export class TaskError extends Error {}
 
 const STATUSES: TaskStatus[] = ["pending", "in_progress", "completed"];
 const USER = "user";
-const LEAD = "lead";
-/** The user and the lead may override ownership and reopen finished tasks. */
+/** The user and main (the lead) may override ownership and reopen finished tasks. */
 const privileged = (by: string): boolean => by === USER || by === LEAD;
 
 const clone = (t: TeamTask): TeamTask => ({ ...t, blockedBy: [...t.blockedBy], notes: t.notes.map((n) => ({ ...n })) });
@@ -73,7 +72,7 @@ export class TaskStoreImpl implements TaskStore {
     const nextStatus = patch.status ?? (patch.owner === null && t.status === "in_progress" ? "pending" : t.status);
     let nextOwner = patch.owner === undefined ? t.owner : (patch.owner ?? undefined);
     if (t.status === "completed" && nextStatus !== "completed" && !privileged(by)) {
-      throw new TaskError(`Task ${id} is completed; only the lead or the user can reopen it.`);
+      throw new TaskError(`Task ${id} is completed; only main or the user can reopen it.`);
     }
     const claiming = nextStatus === "in_progress" && (t.status !== "in_progress" || nextOwner !== t.owner);
     if (patch.owner !== undefined && nextOwner && t.owner && nextOwner !== t.owner && by !== t.owner && !privileged(by)) {

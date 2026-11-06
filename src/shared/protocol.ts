@@ -1,4 +1,4 @@
-// Messages passed between the extension host and the chat webview (protocol v2: agent teams).
+// NextAgent: messages passed between the extension host and the chat webview (protocol v3: teams + modes).
 // Imported by both builds, so keep this file free of runtime dependencies.
 // Owner: manager. Propose changes in TEAMS.md "Contract changes" and message the manager.
 
@@ -12,8 +12,24 @@ export const MODELS = [
   "claude-fable-5-1",
 ] as const;
 
-/** The lead agent always has this name. */
-export const LEAD = "lead";
+/** The main (lead) agent always has this name. */
+export const LEAD = "main";
+/** Names teammates may not use. */
+export const RESERVED_NAMES = ["main", "lead", "user", "all", "system"] as const;
+
+/**
+ * Team-wide permission mode.
+ * plan:   read/search/message/tasks only; edits and commands are refused; main presents a plan for approval.
+ * normal: edits and commands ask in the approval queue ("Approve all edits" per agent still works).
+ * auto:   edits inside the workspace run; commands run unless a hard rule or the safety check says ask.
+ */
+export type Mode = "plan" | "normal" | "auto";
+export const MODES: Mode[] = ["plan", "normal", "auto"];
+
+export interface PlanStep {
+  title: string;
+  detail?: string;
+}
 
 export type ToolStatus =
   | "streaming" // model is still writing the tool input
@@ -35,7 +51,25 @@ export type ChatItem =
       inputChars?: number;
       status: ToolStatus;
       output?: string;
+      /** Set when Auto mode approved this call without asking: "rule" text or the safety check's reason. */
+      autoApproved?: string;
+      /** Set when Plan mode refused this call. */
+      blockedByMode?: Mode;
     }
+  /** A plan presented by main (present_plan). Mirrors the pending plan approval while it waits. */
+  | {
+      kind: "plan";
+      id: string; // the tool_use id
+      title: string;
+      summary: string;
+      steps: PlanStep[];
+      status: "awaiting" | "approved" | "rejected";
+      /** Mode chosen on approval, or the user's feedback on rejection. */
+      approvedMode?: Exclude<Mode, "plan">;
+      feedback?: string;
+    }
+  /** A team-wide mode change, shown as a marker in every agent's chat. */
+  | { kind: "mode"; id: string; mode: Mode; by: string }
   | { kind: "notice"; id: string; level: "info" | "error"; text: string }
   /** A message between agents (or from the user to an agent). Shown in both agents' chats. */
   | { kind: "message"; id: string; from: string; to: string; text: string; idle?: boolean };
@@ -66,6 +100,8 @@ export interface AgentInfo {
   inputTokens: number;
   /** Messages queued for this agent and not yet delivered. */
   pendingMail: number;
+  /** Input tokens (incl. cache) of this agent's most recent request: how full its context window is. */
+  contextTokens: number;
 }
 
 export type TaskStatus = "pending" | "in_progress" | "completed";
@@ -86,10 +122,14 @@ export interface ApprovalRequest {
   /** The tool_use id. */
   id: string;
   agent: string;
+  /** "tool": approve/reject a tool call. "plan": approve main's plan (choosing normal or auto) or send feedback. */
+  kind: "tool" | "plan";
   tool: string;
   input: unknown;
   /** True for file edits/writes, which "Approve all edits" for that agent may cover. */
   coverable: boolean;
+  /** Auto mode: why this call still needs you (hard rule hit or the safety check's reason). */
+  askReason?: string;
 }
 
 export interface SessionConfig {
@@ -100,6 +140,10 @@ export interface SessionConfig {
   hasCredentials: boolean;
   workspaceName?: string;
   maxTeammates: number;
+  /** Team-wide permission mode. */
+  mode: Mode;
+  /** Context window of the model, for the context meter (1_000_000 for current models). */
+  contextWindow: number;
   /** Team budgets. Both refill whenever the user sends a message. Re-sent (throttled) when they change. */
   autoTurnsLeft: number;
   maxAutoTurns: number;
@@ -137,6 +181,9 @@ export type WebviewMessage =
   /** Stop everything and start an empty team with a fresh lead. */
   | { type: "newTeam" }
   | { type: "approval"; id: string; decision: ApprovalDecision; reason?: string }
+  | { type: "setMode"; mode: Mode }
+  /** Answer main's plan: approve (switching the team to `mode`) or reject with feedback (stays in plan mode). */
+  | { type: "planDecision"; id: string; approve: boolean; mode?: Exclude<Mode, "plan">; feedback?: string }
   | { type: "addTeammate"; name: string; role: string; model?: string; effort?: Effort }
   | { type: "removeTeammate"; name: string }
   | { type: "setAgentModel"; agent: string; model: string }

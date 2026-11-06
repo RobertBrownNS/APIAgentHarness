@@ -1,17 +1,22 @@
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Message, MessageContent } from "@/components/ui/message";
+import { Bubble, BubbleContent } from "@/components/ui/bubble";
 
 export function UserBubble({ text }: { text: string }) {
   return (
-    <div className="flex justify-end">
-      <div className="max-w-[90%] whitespace-pre-wrap break-words rounded-lg bg-secondary px-2.5 py-1.5 text-secondary-foreground">
-        {text}
-      </div>
-    </div>
+    <Message align="end">
+      <MessageContent>
+        <Bubble variant="secondary" align="end">
+          <BubbleContent className="whitespace-pre-wrap">{text}</BubbleContent>
+        </Bubble>
+      </MessageContent>
+    </Message>
   );
 }
 
-export function AssistantText({ text }: { text: string }) {
+/** Markdown with the safety rules: no raw HTML, images as text, only http(s)/mailto links. */
+export function Md({ text }: { text: string }) {
   return (
     <div className="markdown min-w-0">
       <Markdown
@@ -29,7 +34,23 @@ export function AssistantText({ text }: { text: string }) {
             ),
           img: ({ alt, src }) => <span className="opacity-70">[image: {alt || src}]</span>,
         }}
-      >{text}</Markdown>
+      >
+        {text}
+      </Markdown>
     </div>
+  );
+}
+
+export function AssistantText({ text }: { text: string }) {
+  return (
+    <Message>
+      <MessageContent>
+        <Bubble variant="ghost">
+          <BubbleContent>
+            <Md text={text} />
+          </BubbleContent>
+        </Bubble>
+      </MessageContent>
+    </Message>
   );
 }

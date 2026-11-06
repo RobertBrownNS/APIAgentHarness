@@ -67,6 +67,11 @@ export class ApprovalQueueImpl implements ApprovalQueue {
     this.approveAllFor.delete(agent);
   }
 
+  /** Forget "approve all edits" for every agent (any mode change). */
+  forgetAll(): void {
+    this.approveAllFor.clear();
+  }
+
   /** True if this agent's later edits are auto-approved. */
   isApproveAll(agent: string): boolean {
     return this.approveAllFor.has(agent);

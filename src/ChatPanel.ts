@@ -4,12 +4,15 @@ import * as vscode from "vscode";
 import { z } from "zod";
 import { hasCredentials } from "./agent/client";
 import type { Effort, HostMessage, WebviewMessage } from "./shared/protocol";
-import { EFFORTS } from "./shared/protocol";
+import { EFFORTS, MODES } from "./shared/protocol";
+import { createCommandClassifier } from "./agent/classifier";
+import type { Mode } from "./shared/protocol";
 import { AgentSession } from "./agent/loop";
 import { Team, type TeamSettings } from "./team/team";
 
 const effortSchema = z.enum(EFFORTS as [Effort, ...Effort[]]);
 const nameSchema = z.string().min(1).max(64);
+const modeSchema = z.enum(MODES as [Mode, ...Mode[]]);
 const taskStatusSchema = z.enum(["pending", "in_progress", "completed"]);
 
 const messageSchema = z.discriminatedUnion("type", [
@@ -23,6 +26,14 @@ const messageSchema = z.discriminatedUnion("type", [
     id: z.string().min(1).max(200),
     decision: z.enum(["approve", "approveAll", "reject"]),
     reason: z.string().max(10_000).optional(),
+  }),
+  z.object({ type: z.literal("setMode"), mode: modeSchema }),
+  z.object({
+    type: z.literal("planDecision"),
+    id: z.string().min(1).max(200),
+    approve: z.boolean(),
+    mode: z.enum(["normal", "auto"]).optional(),
+    feedback: z.string().max(10_000).optional(),
   }),
   z.object({
     type: z.literal("addTeammate"),
@@ -51,7 +62,7 @@ const messageSchema = z.discriminatedUnion("type", [
 
 /** The single editor tab hosting the agent team chat. Closing it disposes the team. */
 export class ChatPanel {
-  static readonly viewType = "agentHarness.panel";
+  static readonly viewType = "nextAgent.panel";
   private static current: ChatPanel | undefined;
 
   private team: Team;
@@ -60,7 +71,11 @@ export class ChatPanel {
   private pending = 0;
   private readonly root: string;
   private teamSeq = 0;
+  private mode: Mode = "normal";
   private static readonly pendingEmitter = new vscode.EventEmitter<number>();
+  private static readonly modeEmitter = new vscode.EventEmitter<Mode>();
+  /** Fires whenever the team's mode changes (and when the panel opens or closes, with the default mode). */
+  static readonly onModeChange = ChatPanel.modeEmitter.event;
   /** Fires with the number of approvals waiting while the tab is not focused (0 otherwise). */
   static readonly onPendingApprovals = ChatPanel.pendingEmitter.event;
 
@@ -72,7 +87,7 @@ export class ChatPanel {
     }
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
-      void vscode.window.showErrorMessage("Agent Harness: open a folder first.");
+      void vscode.window.showErrorMessage("NextAgent: open a folder first.");
       return undefined;
     }
     const creds = await hasCredentials(context.secrets);
@@ -80,12 +95,12 @@ export class ChatPanel {
     const distUri = vscode.Uri.joinPath(context.extensionUri, "webview-ui", "dist");
     const panel = vscode.window.createWebviewPanel(
       ChatPanel.viewType,
-      "Agent Harness",
+      "NextAgent",
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [distUri] },
     );
     panel.iconPath = vscode.Uri.joinPath(context.extensionUri, "media", "icon.svg");
-    ChatPanel.current = new ChatPanel(panel, context, root, creds, distUri);
+    ChatPanel.current = new ChatPanel(panel, context, output, root, creds, distUri);
     return ChatPanel.current;
   }
 
@@ -97,6 +112,7 @@ export class ChatPanel {
   private constructor(
     private readonly panel: vscode.WebviewPanel,
     private readonly context: vscode.ExtensionContext,
+    private readonly output: vscode.OutputChannel,
     root: string,
     private creds: boolean,
     distUri: vscode.Uri,
@@ -109,7 +125,7 @@ export class ChatPanel {
       panel.onDidChangeViewState(() => this.refreshAlert()),
       panel.webview.onDidReceiveMessage((m: unknown) => void this.onMessage(m)),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration("agentHarness")) void this.postConfig();
+        if (e.affectsConfiguration("nextAgent")) void this.postConfig();
       }),
     );
   }
@@ -117,6 +133,7 @@ export class ChatPanel {
   private post(m: HostMessage): void {
     if (this.disposed) return;
     if (m.type === "approvals" || m.type === "snapshot") this.updateAlert(m.approvals.length);
+    if (m.type === "config" || m.type === "snapshot") this.setMode(m.config.mode);
     try {
       void Promise.resolve(this.panel.webview.postMessage(m)).catch(() => undefined);
     } catch {
@@ -130,10 +147,24 @@ export class ChatPanel {
     this.refreshAlert();
   }
 
+  private setMode(mode: Mode): void {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    ChatPanel.modeEmitter.fire(mode);
+  }
+
+  get currentMode(): Mode {
+    return this.mode;
+  }
+
+  setTeamMode(mode: Mode): void {
+    this.team.setMode(mode, "user");
+  }
+
   private refreshAlert(): void {
     if (this.disposed) return;
     const show = this.pending > 0 && !this.panel.active;
-    this.panel.title = show ? `Agent Harness (${this.pending})` : "Agent Harness";
+    this.panel.title = show ? `NextAgent (${this.pending})` : "NextAgent";
     ChatPanel.pendingEmitter.fire(show ? this.pending : 0);
   }
 
@@ -147,11 +178,15 @@ export class ChatPanel {
         if (seq === this.teamSeq) this.post(m);
       },
       createAgent: (o) => new AgentSession(o),
+      classify: createCommandClassifier(this.context.secrets, () =>
+        vscode.workspace.getConfiguration("nextAgent").get<string>("autoSafetyModel", "claude-haiku-5-5"),
+      ),
+      log: (line) => this.output.appendLine(line),
     });
   }
 
   private settings(): TeamSettings {
-    const cfg = vscode.workspace.getConfiguration("agentHarness");
+    const cfg = vscode.workspace.getConfiguration("nextAgent");
     return {
       model: cfg.get<string>("model", "claude-opus-5-5"),
       effort: cfg.get<Effort>("effort", "high"),
@@ -162,6 +197,9 @@ export class ChatPanel {
       maxTeamOutputTokens: cfg.get<number>("maxTeamOutputTokens", 1_500_000),
       hasCredentials: this.creds,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
+      autoSafetyCheck: cfg.get<boolean>("autoSafetyCheck", true),
+      contextWindow: 1_000_000,
+      defaultMode: cfg.get<Mode>("defaultMode", "normal") === "plan" ? "plan" : "normal",
     };
   }
 
@@ -244,6 +282,12 @@ export class ChatPanel {
         case "approval":
           this.team.approval(m.id, m.decision, m.reason);
           break;
+        case "setMode":
+          this.team.setMode(m.mode, "user");
+          break;
+        case "planDecision":
+          this.team.planDecision(m.id, m.approve, m.mode, m.feedback);
+          break;
         case "addTeammate":
           this.team.addTeammate({ name: m.name, role: m.role, model: m.model, effort: m.effort });
           break;
@@ -263,12 +307,12 @@ export class ChatPanel {
           this.team.updateTask(m.id, { status: m.status, owner: m.owner });
           break;
         case "setApiKey":
-          await vscode.commands.executeCommand("agentHarness.setApiKey");
+          await vscode.commands.executeCommand("nextAgent.setApiKey");
           break;
       }
     } catch (e) {
       // Team/Task errors carry messages meant for the user (bad name, size limit, blocked task, ...).
-      void vscode.window.showErrorMessage(`Agent Harness: ${e instanceof Error ? e.message : String(e)}`);
+      void vscode.window.showErrorMessage(`NextAgent: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -277,6 +321,7 @@ export class ChatPanel {
     this.disposed = true;
     if (ChatPanel.current === this) ChatPanel.current = undefined;
     ChatPanel.pendingEmitter.fire(0);
+    ChatPanel.modeEmitter.fire(vscode.workspace.getConfiguration("nextAgent").get<string>("defaultMode", "normal") === "plan" ? "plan" : "normal");
     try {
       this.team.dispose();
     } catch {
@@ -308,7 +353,7 @@ export class ChatPanel {
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${webview.asWebviewUri(style)}">
-<title>Agent Harness</title>
+<title>NextAgent</title>
 </head>
 <body>
 <div id="root"></div>

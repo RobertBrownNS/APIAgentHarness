@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { UserPlus } from "lucide-react";
-import { LEAD, type Effort } from "@shared/protocol";
+import { LEAD, RESERVED_NAMES, type Effort } from "@shared/protocol";
 import { post } from "@/vscode";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { EffortSelect, modelOptions } from "@/components/ModelEffortSelects";
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,23}$/;
-const RESERVED = [LEAD, "user", "all"];
+const RESERVED: string[] = [LEAD, ...RESERVED_NAMES];
 const DEFAULT_MODEL = "__default";
 
 function validateName(name: string, existing: string[]): string | undefined {
@@ -25,13 +25,24 @@ export function AddTeammateDialog({
   disabled,
   disabledReason,
   defaultModel,
+  open: openProp,
+  onOpenChange,
+  hideTrigger = false,
 }: {
   existing: string[];
   disabled: boolean;
   disabledReason?: string;
   defaultModel: string;
+  open?: boolean;
+  onOpenChange?: (o: boolean) => void;
+  hideTrigger?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [openState, setOpenState] = useState(false);
+  const open = openProp ?? openState;
+  const setOpen = (o: boolean) => {
+    setOpenState(o);
+    onOpenChange?.(o);
+  };
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL);
@@ -71,11 +82,13 @@ export function AddTeammateDialog({
         if (!o) reset();
       }}
     >
-      <DialogTrigger asChild>
-        <Button variant="secondary" size="sm" className="w-full" disabled={disabled} title={disabledReason}>
-          <UserPlus /> Add teammate
-        </Button>
-      </DialogTrigger>
+      {!hideTrigger && (
+        <DialogTrigger asChild>
+          <Button variant="secondary" size="sm" className="w-full" disabled={disabled} title={disabledReason}>
+            <UserPlus /> Add teammate
+          </Button>
+        </DialogTrigger>
+      )}
       <DialogContent>
         <DialogTitle>Add teammate</DialogTitle>
         <DialogDescription>The teammate starts idle. Give it work by messaging it or assigning it a task.</DialogDescription>

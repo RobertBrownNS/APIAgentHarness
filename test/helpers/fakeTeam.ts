@@ -1,6 +1,6 @@
 import type { AgentInfo, ChatItem, Effort, HostMessage } from "../../src/shared/protocol";
 import { Team, type TeamSettings } from "../../src/team/team";
-import type { AgentHandle, AgentOptions } from "../../src/team/types";
+import type { AgentHandle, AgentOptions, CommandClassifier } from "../../src/team/types";
 
 export type Ended = "done" | "stopped" | "error";
 export interface Call {
@@ -42,6 +42,7 @@ export class FakeAgent implements AgentHandle {
       outputTokens: this.tokens,
       inputTokens: 0,
       pendingMail: 0,
+      contextTokens: 0,
     };
   }
   send(text: string, kind: "user" | "mail") {
@@ -92,7 +93,8 @@ export const flush = async () => {
   for (let i = 0; i < 3; i++) await tick();
 };
 
-export function makeTeam(over: Partial<TeamSettings> = {}) {
+export function makeTeam(over: Partial<TeamSettings> = {}, extra: { classify?: CommandClassifier; log?: (l: string) => void; root?: string } = {}) {
+  const logs: string[] = [];
   const agents = new Map<string, FakeAgent>();
   const emitted: HostMessage[] = [];
   const settings: TeamSettings = {
@@ -106,14 +108,19 @@ export function makeTeam(over: Partial<TeamSettings> = {}) {
     ...over,
   };
   const team = new Team({
-    root: "/ws",
+    root: extra.root ?? "/ws",
     settings: () => settings,
     emit: (m) => emitted.push(m),
+    classify: extra.classify,
+    log: (l) => {
+      logs.push(l);
+      extra.log?.(l);
+    },
     createAgent: (o) => {
       const a = new FakeAgent(o);
       agents.set(o.name, a);
       return a;
     },
   });
-  return { team, agents, emitted, settings, lead: agents.get("lead")! };
+  return { team, agents, emitted, settings, logs, lead: agents.get("main")! };
 }

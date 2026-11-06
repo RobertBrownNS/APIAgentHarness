@@ -1,46 +1,91 @@
-import { useState } from "react";
-import { ArrowRight, ChevronRight, Mail } from "lucide-react";
+import { ArrowRight, Bot } from "lucide-react";
 import type { ChatItem } from "@shared/protocol";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { AssistantText } from "@/components/MessageBubble";
-import { cn } from "@/lib/utils";
+import { Md } from "@/components/MessageBubble";
+import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Message, MessageAvatar, MessageContent, MessageGroup, MessageHeader } from "@/components/ui/message";
+import {
+  Trace,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@/components/ui/trace";
 
-type MessageItem = Extract<ChatItem, { kind: "message" }>;
+export type AgentMessageItem = Extract<ChatItem, { kind: "message" }>;
 
-/** A message between agents (or user -> agent). Idle reports are muted and collapsed. */
-export function MessageCard({ item, viewer }: { item: MessageItem; viewer: string }) {
-  const [open, setOpen] = useState(false);
-  const incoming = item.to === viewer || item.to === "all";
-  const label = (
-    <span className="flex min-w-0 items-center gap-1 text-xs">
-      <Mail className="size-3 shrink-0" />
-      <span className="font-medium">{item.from}</span>
-      <ArrowRight className="size-3 shrink-0" />
-      <span className="font-medium">{item.to === "all" ? "all (broadcast)" : item.to}</span>
-      {item.idle && <span className="text-muted-foreground">(idle report)</span>}
-    </span>
-  );
+export function initials(name: string): string {
+  const parts = name.split(/[-_\s]+/).filter(Boolean);
+  const s = parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2);
+  return s.toUpperCase();
+}
 
-  if (item.idle) {
-    return (
-      <Collapsible open={open} onOpenChange={setOpen} className="rounded-md border border-dashed px-2 py-1 text-muted-foreground">
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 text-left hover:text-foreground">
-          <ChevronRight className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")} />
-          {label}
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="mt-1 max-h-60 overflow-y-auto border-t pt-1 text-xs">
-            <AssistantText text={item.text} />
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
-    );
-  }
-
+export function Avatar({ name }: { name: string }) {
   return (
-    <div className={cn("rounded-md border px-2 py-1.5", incoming ? "border-primary/50" : "")}>
-      <div className="mb-1 text-muted-foreground">{label}</div>
-      <div className="whitespace-pre-wrap break-words text-xs">{item.text}</div>
-    </div>
+    <MessageAvatar className="size-8 text-[11px] font-semibold text-muted-foreground" title={name} aria-label={name}>
+      {initials(name)}
+    </MessageAvatar>
+  );
+}
+
+function IdleReport({ item }: { item: AgentMessageItem }) {
+  return (
+    <Trace>
+      <TraceCollapsible>
+        <TraceCollapsibleTrigger>
+          <TraceLine>
+            <TraceIcon>
+              <Bot />
+            </TraceIcon>
+            <TraceTitle>{item.from} finished a turn</TraceTitle>
+            <TraceDescription>idle report</TraceDescription>
+          </TraceLine>
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent>
+          <div className="max-h-60 overflow-y-auto text-xs">
+            <Md text={item.text} />
+          </div>
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+    </Trace>
+  );
+}
+
+/**
+ * Consecutive messages from one sender, shown as Messages from that sender (avatar, "name -> to" header, tinted Bubble).
+ * Text is plain text, never HTML. Idle reports are collapsed Subagent-style Trace lines.
+ */
+export function AgentMessageGroup({ items, viewer }: { items: AgentMessageItem[]; viewer: string }) {
+  const from = items[0].from;
+  const mine = from === viewer;
+  return (
+    <Message>
+      {!mine && <Avatar name={from} />}
+      <MessageContent>
+        <MessageGroup>
+          {items.map((item) => {
+            const to = item.to === "all" ? "all (broadcast)" : item.to;
+            return (
+              <div key={item.id} className="flex min-w-0 flex-col gap-1">
+                <MessageHeader className="gap-1 px-0">
+                  <span className="text-foreground">{from}</span>
+                  <ArrowRight className="size-3" />
+                  <span>{to}</span>
+                </MessageHeader>
+                {item.idle ? (
+                  <IdleReport item={item} />
+                ) : (
+                  <Bubble variant={mine ? "outline" : "tinted"}>
+                    <BubbleContent className="whitespace-pre-wrap text-xs">{item.text}</BubbleContent>
+                  </Bubble>
+                )}
+              </div>
+            );
+          })}
+        </MessageGroup>
+      </MessageContent>
+    </Message>
   );
 }

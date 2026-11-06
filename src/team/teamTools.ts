@@ -34,16 +34,28 @@ const schemas = {
     note: z.string().max(2000).optional(),
   }),
   team_roster: z.object({}),
+  present_plan: z.object({
+    title: z.string().min(1).max(200),
+    summary: z.string().min(1).max(4000),
+    steps: z
+      .array(z.object({ title: z.string().min(1).max(300), detail: z.string().max(2000).optional() }))
+      .min(1)
+      .max(30),
+  }),
 };
 
 type TeamToolName = keyof typeof schemas;
 
-const LEAD_ONLY: ReadonlySet<string> = new Set(["spawn_teammate", "stop_teammate"]);
+const LEAD_ONLY: ReadonlySet<string> = new Set(["spawn_teammate", "stop_teammate", "present_plan"]);
 
 export interface TeamToolContext {
   self: string;
   isLead: boolean;
   team: TeamContext;
+  /** The tool_use id of this call (used as the plan's id). */
+  toolUseId?: string;
+  /** Aborts when the agent's turn is stopped (present_plan waits on the user). */
+  signal?: AbortSignal;
 }
 
 export function isTeamTool(name: string): boolean {
@@ -54,11 +66,11 @@ const defs: Anthropic.Beta.BetaTool[] = [
   {
     name: "spawn_teammate",
     description:
-      "Lead only. Create a teammate that runs its own agent loop and starts working immediately on `prompt`. Teammates cannot see your conversation, so put everything they need in the prompt. Each teammate costs tokens: spawn only when parallel work pays off.",
+      "Main only. Create a teammate that runs its own agent loop and starts working immediately on `prompt`. Teammates cannot see your conversation, so put everything they need in the prompt. Each teammate costs tokens: spawn only when parallel work pays off.",
     input_schema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Lowercase letters, digits and dashes, 2-24 chars, starting with a letter. Not lead/user/all." },
+        name: { type: "string", description: "Lowercase letters, digits and dashes, 2-24 chars, starting with a letter. Not main/lead/user/all/system." },
         role: { type: "string", description: "One line, e.g. 'Writes unit tests'" },
         prompt: { type: "string", description: "Full instructions for the teammate's first turn" },
         model: { type: "string", description: "Optional model id (default: the configured teammate model)" },
@@ -70,7 +82,7 @@ const defs: Anthropic.Beta.BetaTool[] = [
   },
   {
     name: "stop_teammate",
-    description: "Lead only. Stop a teammate and release its unfinished tasks. It stays in the roster as stopped.",
+    description: "Main only. Stop a teammate and release its unfinished tasks. It stays in the roster as stopped.",
     input_schema: {
       type: "object",
       properties: { name: { type: "string" } },
@@ -81,7 +93,7 @@ const defs: Anthropic.Beta.BetaTool[] = [
   {
     name: "send_message",
     description:
-      "Send a short message to a teammate (or the lead) by name, or to every other agent with to='all'. The recipient reads it when its current turn ends. You cannot message the user: reply in your own chat.",
+      "Send a short message to a teammate (or main) by name, or to every other agent with to='all'. The recipient reads it when its current turn ends. You cannot message the user: reply in your own chat.",
     input_schema: {
       type: "object",
       properties: {
@@ -139,13 +151,37 @@ const defs: Anthropic.Beta.BetaTool[] = [
     },
   },
   {
+    name: "present_plan",
+    description:
+      "Main only, Plan mode only. Present a concrete plan for the user to approve. Blocks until the user decides: if approved the team leaves Plan mode (Normal or Auto) and you carry out the plan; if not, you get the user's feedback and stay in Plan mode. Teammates cannot call this; they report findings to main by message.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short plan title" },
+        summary: { type: "string", description: "What will be done and why (a few sentences)" },
+        steps: {
+          type: "array",
+          description: "Ordered steps, at most 30",
+          items: {
+            type: "object",
+            properties: { title: { type: "string" }, detail: { type: "string" } },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["title", "summary", "steps"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "team_roster",
     description: "List every agent on the team: name, role, model, status.",
     input_schema: { type: "object", properties: {}, additionalProperties: false },
   },
 ].map((t) => ({ ...t, eager_input_streaming: true }) as Anthropic.Beta.BetaTool);
 
-/** Tool definitions for an agent. Lead-only tools are left out for teammates (and refused again in the executor). */
+/** Tool definitions for an agent. Main-only tools are left out for teammates (and refused again in the executor). */
 export function teamToolDefinitions(isLead: boolean): Anthropic.Beta.BetaTool[] {
   return defs.filter((d) => isLead || !LEAD_ONLY.has(d.name));
 }
@@ -183,7 +219,7 @@ function taskFull(t: TeamTask): string {
 
 function requireLead(name: string, ctx: TeamToolContext): void {
   if (LEAD_ONLY.has(name) && (!ctx.isLead || ctx.self !== LEAD)) {
-    throw new TeamToolError(`${name} is only available to the lead.`);
+    throw new TeamToolError(`${name} is only available to main.`);
   }
 }
 
@@ -276,11 +312,23 @@ export async function runTeamTool(name: string, input: unknown, ctx: TeamToolCon
       }
       return `Updated.\n${taskFull(t)}`;
     }
+    case "present_plan": {
+      const a = parse("present_plan", input);
+      if (team.mode !== "plan") {
+        throw new TeamToolError(`present_plan is only available in Plan mode; the team is in ${team.mode} mode.`);
+      }
+      const res = await team.presentPlan(
+        { id: ctx.toolUseId ?? `plan-${Date.now()}`, agent: self, title: a.title, summary: a.summary, steps: a.steps },
+        ctx.signal ?? new AbortController().signal,
+      );
+      if (res.approved) return `Plan approved. Mode is now ${res.mode ?? "normal"}. Carry out the plan.`;
+      return `Plan not approved. User feedback: ${res.feedback || "(none given)"}`;
+    }
     case "team_roster": {
       parse("team_roster", input);
       return team
         .roster()
-        .map((r) => `${r.name}${r.isLead ? " (lead)" : ""} | ${r.role || "-"} | ${r.model} | ${r.status}`)
+        .map((r) => `${r.name}${r.isLead ? " (main)" : ""} | ${r.role || "-"} | ${r.model} | ${r.status}`)
         .join("\n");
     }
   }

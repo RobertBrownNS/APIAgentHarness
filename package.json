@@ -1,7 +1,7 @@
 {
-  "name": "agent-harness-vscode",
-  "displayName": "Agent Harness",
-  "description": "A Claude-powered coding agent with its own tool loop, in a VS Code side panel.",
+  "name": "nextagent",
+  "displayName": "NextAgent",
+  "description": "NextAgent: a Claude-powered coding agent team with its own tool loop, in a VS Code editor tab.",
   "version": "0.1.0",
   "publisher": "local",
   "private": true,
@@ -23,40 +23,45 @@
   "contributes": {
     "commands": [
       {
-        "command": "agentHarness.open",
+        "command": "nextAgent.open",
         "title": "Open",
-        "category": "Agent Harness"
+        "category": "NextAgent"
       },
       {
-        "command": "agentHarness.newTeam",
+        "command": "nextAgent.newTeam",
         "title": "New Team",
-        "category": "Agent Harness"
+        "category": "NextAgent"
       },
       {
-        "command": "agentHarness.stopAll",
+        "command": "nextAgent.stopAll",
         "title": "Stop All Agents",
-        "category": "Agent Harness"
+        "category": "NextAgent"
       },
       {
-        "command": "agentHarness.setApiKey",
+        "command": "nextAgent.setApiKey",
         "title": "Set API Key",
-        "category": "Agent Harness"
+        "category": "NextAgent"
       },
       {
-        "command": "agentHarness.clearApiKey",
+        "command": "nextAgent.clearApiKey",
         "title": "Clear API Key",
-        "category": "Agent Harness"
+        "category": "NextAgent"
+      },
+      {
+        "command": "nextAgent.setMode",
+        "title": "Set Mode",
+        "category": "NextAgent"
       }
     ],
     "configuration": {
-      "title": "Agent Harness",
+      "title": "NextAgent",
       "properties": {
-        "agentHarness.model": {
+        "nextAgent.model": {
           "type": "string",
           "default": "claude-opus-5-5",
           "description": "Claude model ID used by the agent."
         },
-        "agentHarness.effort": {
+        "nextAgent.effort": {
           "type": "string",
           "enum": [
             "low",
@@ -68,54 +73,78 @@
           "default": "high",
           "description": "How much effort (thinking depth and token spend) the model puts into each turn."
         },
-        "agentHarness.maxTokens": {
+        "nextAgent.maxTokens": {
           "type": "number",
           "default": 64000,
           "description": "Maximum output tokens per model response."
         },
-        "agentHarness.autoApproveReads": {
+        "nextAgent.autoApproveReads": {
           "type": "boolean",
           "default": true,
-          "description": "Run read-only tools (read, list, search) without asking."
+          "description": "Run read-only tools (read, list, search) without asking.",
+          "scope": "machine"
         },
-        "agentHarness.commandTimeoutSec": {
+        "nextAgent.commandTimeoutSec": {
           "type": "number",
           "default": 120,
-          "description": "Kill terminal commands that run longer than this many seconds."
+          "description": "Kill terminal commands that run longer than this many seconds.",
+          "scope": "machine"
         },
-        "agentHarness.refusalFallback": {
+        "nextAgent.refusalFallback": {
           "type": "boolean",
           "default": true,
           "description": "If the model declines a request, let the API retry it on a fallback model automatically."
         },
-        "agentHarness.teammateModel": {
+        "nextAgent.teammateModel": {
           "type": "string",
           "default": "",
-          "description": "Model for new teammates. Empty means the same as the lead (agentHarness.model)."
+          "description": "Model for new teammates. Empty means the same as main (nextAgent.model)."
         },
-        "agentHarness.maxTeammates": {
+        "nextAgent.maxTeammates": {
           "type": "number",
           "default": 5,
           "minimum": 0,
-          "description": "Maximum number of teammates (not counting the lead)."
+          "description": "Maximum number of teammates (not counting main)."
         },
-        "agentHarness.maxAutoTurns": {
+        "nextAgent.maxAutoTurns": {
           "type": "number",
           "default": 40,
           "minimum": 1,
           "description": "Maximum automatic (message-triggered) agent turns per team before agents pause; refilled whenever you send a message."
         },
-        "agentHarness.maxTurnIterations": {
+        "nextAgent.maxTurnIterations": {
           "type": "number",
           "default": 40,
           "minimum": 1,
           "description": "Maximum model calls in a single agent turn before the turn ends with a notice."
         },
-        "agentHarness.maxTeamOutputTokens": {
+        "nextAgent.maxTeamOutputTokens": {
           "type": "number",
           "default": 1500000,
           "minimum": 1000,
           "description": "Team-wide budget in output-equivalent tokens (output tokens plus input and cache tokens, weighted by price). When it is used up, all agents pause. It refills when you send a message."
+        },
+        "nextAgent.defaultMode": {
+          "type": "string",
+          "enum": [
+            "plan",
+            "normal"
+          ],
+          "default": "normal",
+          "description": "Permission mode for a new team. Plan: read-only, main presents a plan. Normal: edits and commands need approval. Auto can only be switched on from the mode switcher.",
+          "scope": "machine"
+        },
+        "nextAgent.autoSafetyCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "In Auto mode, ask a small model to judge commands that no rule covers. When off, those commands ask you.",
+          "scope": "machine"
+        },
+        "nextAgent.autoSafetyModel": {
+          "type": "string",
+          "default": "claude-haiku-5-5",
+          "description": "Model used for the Auto mode safety check.",
+          "scope": "machine"
         }
       }
     }

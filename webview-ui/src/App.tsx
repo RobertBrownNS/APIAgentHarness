@@ -3,7 +3,7 @@ import type { HostMessage } from "@shared/protocol";
 import { LEAD } from "@shared/protocol";
 import { post } from "@/vscode";
 import { initialState, reducer } from "@/lib/state";
-import { ShowQueueContext } from "@/lib/ui-context";
+import { ApprovalsContext } from "@/lib/ui-context";
 import { Header } from "@/components/Header";
 import { Roster } from "@/components/Roster";
 import { ChatPane } from "@/components/ChatPane";
@@ -59,6 +59,18 @@ export default function App() {
   const current = agents.find((a) => a.name === selected) ?? agents.find((a) => a.name === LEAD);
   const anyBusy = agents.some((a) => a.status === "running" || a.status === "awaiting");
   const teammateCount = agents.filter((a) => !a.isLead && a.status !== "stopped").length;
+  const solo = agents.length <= 1;
+  const ctx = useMemo(
+    () => ({ inline: solo, byId: Object.fromEntries(approvals.map((r) => [r.id, r])), showQueue }),
+    [solo, approvals, showQueue],
+  );
+  // Once the right column has appeared it stays for the session, so the layout does not jump.
+  const [rightSticky, setRightSticky] = useState(false);
+  const wantRight = !solo || tasks.length > 0;
+  useEffect(() => {
+    if (wantRight) setRightSticky(true);
+  }, [wantRight]);
+  const showRight = wantRight || rightSticky;
   const unreadTotal = useMemo(
     () => Object.entries(state.unread).reduce((n, [k, v]) => (k === selected ? n : n + v), 0),
     [state.unread, selected],
@@ -76,26 +88,34 @@ export default function App() {
     />
   );
   const chat = current ? (
-    <ChatPane agent={current} items={state.transcripts[current.name] ?? []} />
+    <ChatPane agent={current} items={state.transcripts[current.name] ?? []} config={config} />
   ) : (
     <div className="p-4 text-center text-xs text-muted-foreground">{state.loaded ? "No agents." : "Starting…"}</div>
   );
-  const queue = <ApprovalQueue approvals={approvals} onSelectAgent={select} />;
+  const queue = <ApprovalQueue approvals={approvals} transcripts={state.transcripts} onSelectAgent={select} />;
   const board = <TaskBoard tasks={tasks} agents={agents} />;
 
   return (
-    <ShowQueueContext.Provider value={showQueue}>
+    <ApprovalsContext.Provider value={ctx}>
       <div ref={root} className="flex h-full min-w-0 flex-col">
-        <Header config={config} anyBusy={anyBusy} totalTokens={agents.reduce((n, a) => n + a.inputTokens + a.outputTokens, 0)} approvals={approvals.length} />
-        {narrow ? (
+        <Header
+          config={config}
+          anyBusy={anyBusy}
+          totalTokens={agents.reduce((n, a) => n + a.inputTokens + a.outputTokens, 0)}
+          approvals={approvals.length}
+          solo={solo}
+          agentNames={agents.map((a) => a.name)}
+          teamFull={teammateCount >= config.maxTeammates}
+        />
+        {narrow && (!solo || tasks.length > 0) ? (
           <>
             <div role="tablist" className="flex shrink-0 border-b bg-sidebar">
               {(
                 [
-                  ["team", "Team", unreadTotal, "default"],
-                  ["chat", "Chat", 0, "default"],
-                  ["work", "Approvals & tasks", approvals.length, "warning"],
-                ] as const
+                  ...(solo ? [] : [["team", "Team", unreadTotal, "default"] as const]),
+                  ["chat", "Chat", 0, "default"] as const,
+                  ["work", solo ? "Tasks" : "Approvals & tasks", approvals.length, "warning"] as const,
+                ]
               ).map(([id, label, n, variant]) => (
                 <button
                   key={id}
@@ -113,12 +133,16 @@ export default function App() {
               ))}
             </div>
             <div className="min-h-0 flex-1 bg-sidebar/0">
-              {tab === "team" && <div className="h-full bg-sidebar">{roster}</div>}
+              {tab === "team" && !solo && <div className="h-full bg-sidebar">{roster}</div>}
               {tab === "chat" && chat}
               {tab === "work" && (
                 <ScrollArea className="h-full">
-                  <SectionTitle count={approvals.length}>Approvals</SectionTitle>
-                  {queue}
+                  {!solo && (
+                    <>
+                      <SectionTitle count={approvals.length}>Approvals</SectionTitle>
+                      {queue}
+                    </>
+                  )}
                   <SectionTitle>Tasks</SectionTitle>
                   {board}
                 </ScrollArea>
@@ -127,24 +151,30 @@ export default function App() {
           </>
         ) : (
           <div className="flex min-h-0 flex-1">
-            <aside className="flex w-[220px] shrink-0 flex-col border-r bg-sidebar">
-              <SectionTitle>Team</SectionTitle>
-              <div className="min-h-0 flex-1">{roster}</div>
-            </aside>
+            {!solo && (
+              <aside className="flex w-[220px] shrink-0 flex-col border-r bg-sidebar">
+                <SectionTitle>Team</SectionTitle>
+                <div className="min-h-0 flex-1">{roster}</div>
+              </aside>
+            )}
             <main className="min-w-0 flex-1">{chat}</main>
+            {showRight && (
             <aside className="flex w-[340px] shrink-0 flex-col border-l bg-sidebar">
-              <div className="flex min-h-0 basis-1/2 flex-col border-b">
-                <SectionTitle count={approvals.length}>Approvals</SectionTitle>
-                <ScrollArea className="min-h-0 flex-1">{queue}</ScrollArea>
-              </div>
-              <div className="flex min-h-0 basis-1/2 flex-col">
+              {!solo && (
+                <div className="flex min-h-0 basis-1/2 flex-col border-b">
+                  <SectionTitle count={approvals.length}>Approvals</SectionTitle>
+                  <ScrollArea className="min-h-0 flex-1">{queue}</ScrollArea>
+                </div>
+              )}
+              <div className="flex min-h-0 flex-1 basis-1/2 flex-col">
                 <SectionTitle>Tasks</SectionTitle>
                 <ScrollArea className="min-h-0 flex-1">{board}</ScrollArea>
               </div>
             </aside>
+            )}
           </div>
         )}
       </div>
-    </ShowQueueContext.Provider>
+    </ApprovalsContext.Provider>
   );
 }

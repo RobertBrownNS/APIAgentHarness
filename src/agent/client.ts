@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type * as vscode from "vscode";
 
-export const SECRET_KEY = "agentHarness.apiKey";
+export const SECRET_KEY = "nextAgent.apiKey";
 
 /**
  * Build a client from the key saved in VS Code's secret storage. With no saved key,
