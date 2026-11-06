@@ -21,7 +21,8 @@ const ctx = {
   freshFile: (p: string) => normalizePath(p) === normalizePath(inRoot("fresh.js")),
   scriptBody: (n: string) => SCRIPTS[n],
 };
-const v = (c: string) => checkCommand(c, ROOT, ctx);
+/** Windows forms (backslash paths) run under cmd.exe; everything else under the other shell too, so both are exercised. */
+const v = (c: string, shell?: "cmd" | "posix") => checkCommand(c, ROOT, shell ? { ...ctx, shell } : ctx);
 
 /** Must be "allow": no classifier round trip, no prompt. */
 const ALLOW = [
@@ -107,7 +108,9 @@ describe("Auto routine corpus: the same commands with a danger attached still as
   for (const base of BASES) {
     it.each(DANGER)(`${base}%s asks`, (d) => {
       const c = base + d;
-      expect(v(c).verdict, c).toBe("ask");
+      // $() and backticks are real for sh; cmd.exe treats them as text (the other dangers ask in both shells)
+      expect(v(c, "posix").verdict, c).toBe("ask");
+      if (!/[$`]/.test(d)) expect(v(c, "cmd").verdict, c).toBe("ask");
     });
   }
 });

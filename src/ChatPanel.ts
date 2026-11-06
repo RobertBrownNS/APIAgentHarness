@@ -286,7 +286,7 @@ export class ChatPanel {
           this.team.setMode(m.mode, "user");
           break;
         case "planDecision":
-          this.team.planDecision(m.id, m.approve, m.mode, m.feedback);
+          this.team.planDecision(m.id, m.approve, m.mode === "ultra" ? undefined : m.mode, m.feedback);
           break;
         case "addTeammate":
           this.team.addTeammate({ name: m.name, role: m.role, model: m.model, effort: m.effort });

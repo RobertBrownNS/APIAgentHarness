@@ -158,8 +158,10 @@ function MessageListImpl({
       <MessageScroller className="min-h-0 flex-1">
         <MessageScrollerViewport aria-label={`${agent} conversation`}>
           <MessageScrollerContent className="gap-4 p-2.5">
+            {/* No scrollAnchor: anchoring pins the user's turn and stops following the stream. With autoScroll the
+                thread follows new output while the user is at the bottom, and stays put if they scrolled up. */}
             {blocks.map((b) => (
-              <MessageScrollerItem key={b.id} messageId={b.id} scrollAnchor={b.kind === "user"}>
+              <MessageScrollerItem key={b.id} messageId={b.id}>
                 {b.kind === "user" ? (
                   <Message align="end">
                     <MessageContent>

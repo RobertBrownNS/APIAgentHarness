@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import { checkCommand, checkEdit, normalizePath } from "../src/team/autoPolicy";
 
 const ROOT = path.resolve("/ws/project");
-const verdict = (c: string) => checkCommand(c, ROOT).verdict;
+/** Commands that use $ or backticks are judged as sh would run them; %VAR% and ^ as cmd.exe would; the rest on both. */
+const shellsFor = (c: string): ("cmd" | "posix")[] => (/[$`]/.test(c) ? ["posix"] : /[%^]/.test(c) ? ["cmd"] : ["cmd", "posix"]);
+const run = (c: string, shell: "cmd" | "posix") => checkCommand(c, ROOT, { written: new Set(), shell });
+/** Verdict for a command in the shell(s) it targets; if the shells disagree the less strict answer is returned. */
+const verdict = (c: string) => {
+  const vs = shellsFor(c).map((sh) => run(c, sh).verdict);
+  return vs.includes("allow") ? "allow" : vs.includes("classify") ? "classify" : "ask";
+};
 const outside = process.platform === "win32" ? "C:\\Windows\\System32\\drivers\\etc\\hosts" : "/etc/passwd";
 
 
@@ -317,15 +324,6 @@ const MUST_ASK: [string, string[]][] = [
       "echo x &> .env",
     ],
   ],
-  [
-    "long commands",
-    [
-      "echo " + "a".repeat(2001),
-      "x".repeat(2001),
-      "echo " + "a ".repeat(1001),
-      "echo ok " + "#".repeat(5000),
-    ],
-  ],
 ];
 
 /** Commands that must NOT be hard-refused: they go to the classifier. */
@@ -442,9 +440,11 @@ describe("autoPolicy.checkCommand: hard rules", () => {
       for (const cmd of cmds) {
         const t = GAP_ASK.has(cmd) ? it.fails : it;
         t(`asks: ${cmd.slice(0, 100)}`, () => {
-          const r = checkCommand(cmd, ROOT);
-          expect(r.verdict, cmd.slice(0, 120)).toBe("ask");
-          if (r.verdict === "ask") expect(r.rule.length).toBeGreaterThan(0);
+          for (const sh of shellsFor(cmd)) {
+            const r = run(cmd, sh);
+            expect(r.verdict, `${sh}: ${cmd.slice(0, 120)}`).toBe("ask");
+            if (r.verdict === "ask") expect(r.rule.length).toBeGreaterThan(0);
+          }
         });
       }
     });
@@ -678,10 +678,33 @@ describe("autoPolicy.checkCommand: package scripts (PolicyContext.scriptBody)", 
 });
 
 describe("autoPolicy.checkCommand: edge cases", () => {
-  it("2000 characters is allowed, 2001 is not", () => {
-    const base = "echo ";
-    expect(verdict(base + "a".repeat(2000 - base.length))).not.toBe("ask");
-    expect(verdict(base + "a".repeat(2001 - base.length))).toBe("ask");
+  it("length: a command the rules allow is allowed however long (up to the hard cap)", () => {
+    expect(verdict("echo " + "a".repeat(3000))).toBe("allow");
+    expect(verdict("echo " + "a ".repeat(1500))).toBe("allow");
+    expect(verdict("echo ok " + "#".repeat(5000))).toBe("allow");
+    expect(verdict("echo " + "a".repeat(50_000))).toBe("allow");
+  });
+  it("length: a command that would go to the classifier is classified up to 4000 chars and asks beyond", () => {
+    expect(verdict("make " + "a".repeat(2000))).toBe("classify");
+    expect(verdict("make " + "a".repeat(3990 - 5))).toBe("classify");
+    const r = checkCommand("make " + "a".repeat(4001), ROOT);
+    expect(r.verdict).toBe("ask");
+    if (r.verdict === "ask") expect(r.rule).toMatch(/too long for the safety check/);
+    expect(verdict("x".repeat(4001))).toBe("ask");
+  });
+  it("length: the 4000 boundary", () => {
+    expect(verdict("make " + "a".repeat(4000 - 5))).toBe("classify");
+    expect(verdict("make " + "a".repeat(4001 - 5))).toBe("ask");
+  });
+  it("length: over 100,000 characters always asks, even for an allowlisted command", () => {
+    const r = checkCommand("echo " + "a".repeat(100_000), ROOT);
+    expect(r.verdict).toBe("ask");
+    if (r.verdict === "ask") expect(r.rule).toMatch(/100000/);
+    expect(verdict("echo " + "a".repeat(99_000))).toBe("allow");
+  });
+  it("length: a long command with a danger at the end still asks", () => {
+    expect(verdict("echo " + "a".repeat(5000) + "; git push")).toBe("ask");
+    expect(verdict("echo " + "a ".repeat(2500) + "&& rm -rf .")).toBe("ask");
   });
   it("empty and whitespace-only commands do not throw", () => {
     for (const c of ["", " ", "\n", "\t\t"]) expect(() => checkCommand(c, ROOT)).not.toThrow();
@@ -707,7 +730,7 @@ describe("autoPolicy.checkCommand: edge cases", () => {
   it("absurd nesting does not blow the stack", () => {
     const c = "bash -c '".repeat(300) + "ls" + "'".repeat(300);
     expect(() => checkCommand(c, ROOT)).not.toThrow();
-    expect(verdict(c)).toBe("ask"); // also over 2000 chars
+    expect(verdict(c)).toBe("ask"); // also over 4000 chars
   });
   it("many segments are all checked (the 200th is dangerous)", () => {
     const c = Array.from({ length: 199 }, () => "ls").join(" ; ") + " ; git push";

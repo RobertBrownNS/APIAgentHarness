@@ -4,7 +4,7 @@ import { configureAgentRuntime } from "./agent/loop";
 import { ChatPanel } from "./ChatPanel";
 import { MODES, type Mode } from "./shared/protocol";
 
-const MODE_LABEL: Record<Mode, string> = { plan: "Plan", normal: "Normal", auto: "Auto" };
+const MODE_LABEL: Record<Mode, string> = { plan: "Plan", normal: "Normal", auto: "Auto", ultra: "Ultra" };
 
 function defaultMode(): Mode {
   const v = vscode.workspace.getConfiguration("nextAgent").get<string>("defaultMode", "normal");
@@ -20,7 +20,12 @@ export function activate(context: vscode.ExtensionContext): void {
   let mode: Mode = defaultMode();
   let pending = 0;
   const renderStatus = () => {
-    status.backgroundColor = mode === "auto" ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
+    status.backgroundColor =
+      mode === "ultra"
+        ? new vscode.ThemeColor("statusBarItem.errorBackground")
+        : mode === "auto"
+          ? new vscode.ThemeColor("statusBarItem.warningBackground")
+          : undefined;
     status.text = `${pending > 0 ? "$(bell)" : "$(hubot)"} NextAgent · ${MODE_LABEL[mode]}${pending > 0 ? ` (${pending})` : ""}`;
   };
   renderStatus();
@@ -51,10 +56,30 @@ export function activate(context: vscode.ExtensionContext): void {
           { label: "Plan", description: "Read-only; main presents a plan for approval", mode: "plan" as Mode },
           { label: "Normal", description: "Edits and commands need your approval", mode: "normal" as Mode },
           { label: "Auto", description: "Edits run freely; risky commands still ask", mode: "auto" as Mode },
+          { label: "Ultra", description: "Nearly everything runs without asking (tiny backstop)", mode: "ultra" as Mode },
         ],
         { title: "NextAgent mode" },
       );
       if (!pick) return;
+      if (pick.mode === "ultra") {
+        const ok = await vscode.window.showWarningMessage(
+          "Switch to Ultra mode?",
+          {
+            modal: true,
+            detail: [
+              "In Ultra, agents edit files and run commands without asking, and no safety check runs.",
+              "Only a small backstop still asks you:",
+              "- deleting, moving or writing outside the workspace, a drive root or your home folder",
+              "- git push with force, mirror or delete",
+              "- disk and OS commands (format, dd, shutdown, reg, sudo, chmod/chown -R ...)",
+              "- reading secret files (.env, keys)",
+              "Everything else, including destructive commands inside the workspace, runs immediately.",
+            ].join("\n"),
+          },
+          "Switch to Ultra",
+        );
+        if (ok !== "Switch to Ultra") return;
+      }
       // The mode belongs to the team, so open the panel (and its team) first.
       const panel = await ChatPanel.open(context, output);
       panel?.setTeamMode(pick.mode);

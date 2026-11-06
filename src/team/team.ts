@@ -19,11 +19,16 @@ import { withFileLock } from "./fileLock";
 import { MailboxImpl } from "./mailbox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { checkCommand, checkEdit, globNamesSecrets, isSecretPath, isSensitivePath, normalizePath, packageJsonRisk, writeTargets } from "./autoPolicy";
+import { ultraBackstop, checkCommand, checkEdit, globNamesSecrets, isSecretPath, isSensitivePath, normalizePath, packageJsonRisk, writeTargets } from "./autoPolicy";
 import { TaskStoreImpl } from "./taskStore";
 import type { AgentHandle, AgentOptions, Authorization, CommandClassifier, MailMessage, TeamContext } from "./types";
 
 export class TeamError extends Error {}
+
+function isInsideRoot(target: string, root: string): boolean {
+  const rel = path.relative(root, path.resolve(root, target));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,23}$/;
 const RESERVED = new Set<string>(RESERVED_NAMES);
@@ -37,7 +42,11 @@ const MODE_NOTES: Record<Mode, string> = {
   plan: "Mode is now Plan. You may read, search, message teammates and manage tasks; edit_file, write_file and run_command will be refused. Main: investigate, then call present_plan with a concrete plan.",
   normal: "Mode is now Normal. Edits and commands need the user's approval.",
   auto: "Mode is now Auto. Edits run without asking; commands run unless a safety rule or check asks the user. Prefer safe, reversible steps.",
+  ultra: "Mode is now Ultra: edits and commands run without asking except a few catastrophic actions. Prefer reversible steps and say what you're about to do.",
 };
+
+/** How strict a mode is: a call approved under a looser mode must not run after the team moves to a stricter one. */
+const STRICTNESS: Record<Mode, number> = { ultra: 0, auto: 1, normal: 2, plan: 3 };
 const IDLE_CLIP = 1500;
 const MAX_MAIL = 4000;
 const CONFIG_THROTTLE_MS = 500;
@@ -118,12 +127,13 @@ export class Team implements TeamContext {
   /** package.json edits seen by authorize: normalised path -> what makes it risky (undefined = harmless). */
   private pkgRisk = new Map<string, string | undefined>();
   /** Tool calls approved by Auto mode that have not run yet (id -> true). canRun refuses them once Auto is off. */
-  private autoApprovedIds = new Set<string>();
+  private autoApprovedIds = new Map<string, Mode>();
 
   constructor(private readonly opts: TeamOptions) {
     this.root = opts.root;
     this.autoTurnsLeft = opts.settings().maxAutoTurns;
-    this.currentMode = opts.settings().defaultMode ?? "normal";
+    // Only Plan or Normal can be the starting mode; Auto and Ultra are explicit switches.
+    this.currentMode = opts.settings().defaultMode === "plan" ? "plan" : "normal";
     this.unsubs.push(
       this.tasks.onChange((tasks) => this.onTasks(tasks)),
       this.approvals.onChange((approvals) => this.emit({ type: "approvals", approvals })),
@@ -385,7 +395,7 @@ export class Team implements TeamContext {
 
   /** Switch the team-wide mode: updates config, marks every live agent's chat, and queues a system note for each. */
   setMode(mode: Mode, by = "user"): void {
-    if (this.disposed || !(["plan", "normal", "auto"] as string[]).includes(mode) || mode === this.currentMode) return;
+    if (this.disposed || !(["plan", "normal", "auto", "ultra"] as string[]).includes(mode) || mode === this.currentMode) return;
     // A pending plan is answered "not approved" by any mode change.
     for (const id of [...this.plans.keys()]) this.approvals.resolve(id, "reject", `the mode was changed to ${mode}`);
     this.currentMode = mode;
@@ -424,6 +434,19 @@ export class Team implements TeamContext {
         blockedByMode: "plan",
         reason: PLAN_REFUSAL,
       };
+    }
+    if (mode === "ultra") {
+      // No classifier: only the tiny backstop (catastrophic actions and secrets) can ask.
+      if (!mutating) return { approved: true, autoApproved: "read in Ultra mode" };
+      if (isEdit) {
+        const target = this.editTarget(req);
+        if (!target || !isInsideRoot(target, this.root)) return this.autoAsk(req, signal, "edit target is outside the workspace", "rule");
+        if (isSecretPath(target, this.root)) return this.autoAsk(req, signal, "edit touches a secrets file", "rule");
+        return this.autoOk(req, "edit in Ultra mode", "rule");
+      }
+      const u = ultraBackstop(this.commandOf(req.input), this.root, { written: this.written });
+      if (u.verdict === "ask") return this.autoAsk(req, signal, u.rule, "rule");
+      return this.autoOk(req, "no backstop rule hit", "rule");
     }
     if (mode === "auto") {
       if (!mutating) return { approved: true, autoApproved: "read in Auto mode" };
@@ -535,10 +558,15 @@ export class Team implements TeamContext {
    */
   canRun(tool: string, _agent: string, callId?: string): { ok: true } | { ok: false; reason: string; blockedByMode: Mode } {
     if (this.currentMode === "plan" && MUTATING_TOOLS.has(tool)) return { ok: false, reason: PLAN_REFUSAL, blockedByMode: "plan" };
-    if (callId !== undefined && this.autoApprovedIds.has(callId)) {
+    const approvedIn = callId !== undefined ? this.autoApprovedIds.get(callId) : undefined;
+    if (callId !== undefined && approvedIn !== undefined) {
       this.autoApprovedIds.delete(callId);
-      if (this.currentMode !== "auto") {
-        return { ok: false, reason: `The mode changed to ${this.currentMode} after this call was auto-approved. Ask again; it now needs the user's approval.`, blockedByMode: this.currentMode };
+      if (STRICTNESS[this.currentMode] > STRICTNESS[approvedIn]) {
+        return {
+          ok: false,
+          reason: `The mode changed from ${approvedIn} to ${this.currentMode} after this call was approved without asking. Ask again; it now needs the user's approval.`,
+          blockedByMode: this.currentMode,
+        };
       }
     }
     return { ok: true };
@@ -564,7 +592,7 @@ export class Team implements TeamContext {
     const clip = (x: string) => x.replace(/\s+/g, " ").trim().slice(0, 200);
     const isCmd = req.tool === "run_command";
     const subject = isCmd ? clip(this.commandOf(req.input)) : `edit ${clip(this.pathOf(req.input) ?? req.tool)}`;
-    this.opts.log?.(`[auto] ${outcome} (${source}: ${clip(why)}) ${req.agent}: ${subject}`);
+    this.opts.log?.(`[${this.currentMode === "ultra" ? "ultra" : "auto"}] ${outcome} (${source}: ${clip(why)}) ${req.agent}: ${subject}`);
   }
 
   private autoAsk(
@@ -578,7 +606,7 @@ export class Team implements TeamContext {
   }
 
   private autoOk(req: { id?: string; agent: string; tool: string; input: unknown }, why: string, source: "rule" | "check"): Authorization {
-    if (req.id) this.autoApprovedIds.add(req.id);
+    if (req.id) this.autoApprovedIds.set(req.id, this.currentMode);
     if (req.tool === "run_command") for (const p of writeTargets(this.commandOf(req.input), this.root)) this.written.add(p);
     this.logAuto("allow", source, req, why);
     // Classifier text is model-generated: show it as plain text, clipped.

@@ -22,9 +22,12 @@ export const RESERVED_NAMES = ["main", "lead", "user", "all", "system"] as const
  * plan:   read/search/message/tasks only; edits and commands are refused; main presents a plan for approval.
  * normal: edits and commands ask in the approval queue ("Approve all edits" per agent still works).
  * auto:   edits inside the workspace run; commands run unless a hard rule or the safety check says ask.
+ * ultra:  everything runs without asking or a safety check, except a tiny backstop: deleting/moving/writing
+ *         outside the workspace, force-pushing or deleting remote git history, disk/OS-level commands, and
+ *         reading secret files. Never a default; switching to it always needs the user's confirmation.
  */
-export type Mode = "plan" | "normal" | "auto";
-export const MODES: Mode[] = ["plan", "normal", "auto"];
+export type Mode = "plan" | "normal" | "auto" | "ultra";
+export const MODES: Mode[] = ["plan", "normal", "auto", "ultra"];
 
 export interface PlanStep {
   title: string;

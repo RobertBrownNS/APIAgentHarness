@@ -14,6 +14,8 @@ export interface PolicyContext {
   freshFile?: (absPath: string) => boolean;
   /** True once package.json was edited this session (even harmlessly): installs then ask because they run lifecycle scripts. */
   packageJsonChanged?: boolean;
+  /** Shell that will run the command; defaults to cmd on Windows and sh elsewhere (how run_command spawns). */
+  shell?: ShellKind;
 }
 
 export type CommandVerdict =
@@ -22,7 +24,10 @@ export type CommandVerdict =
   | { verdict: "ask"; rule: string };
 export type EditVerdict = { verdict: "ask"; rule: string } | { verdict: "allow" };
 
-const MAX_COMMAND_CHARS = 2000;
+/** Hard cap only to bound the policy's own work; long commands are judged like any other. */
+const MAX_COMMAND_CHARS = 100_000;
+/** The safety check reads at most this much (src/agent/classifier.ts); longer commands can't be judged by it. */
+const CLASSIFIER_CHARS = 4000;
 const MAX_SCRIPT_DEPTH = 3;
 
 // ---- paths ----
@@ -207,14 +212,15 @@ interface Rule {
 
 // Applied to every segment (after splitting on ; && || | & and newlines).
 const SEGMENT_RULES: Rule[] = [
-  { name: "recursive delete (rm -r)", re: /\brm\b(?=[^\n]*\s(-[a-z]*r[a-z]*|--recursive)(\s|$))/i },
+  { name: "recursive delete (rm -r)", re: /\brm\b[^\n]*\s(-[a-z]*r[a-z]*|--recursive)(\s|$)/i },
   { name: "recursive delete (rmdir/rd/del /s)", re: /\b(rmdir|rd|del|erase)\b[^\n]*\s\/s\b/i },
-  { name: "recursive delete (Remove-Item -Recurse)", re: /\b(remove-item|ri|rm|del|rd|rmdir)\b[^\n]*\s-recurse\b/i },
+  { name: "recursive delete (Remove-Item -Recurse)", re: /\b(remove-item|ri|rm|del|erase|rd|rmdir)\b[^\n]*\s-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?:\s|$|:)/i },
   { name: "creating a link (ln/mklink)", re: /(^|[\s;&|(`])(ln|mklink)(\s|$)/i },
   { name: "creating a link (New-Item -ItemType)", re: /\b(new-item|ni)\b[^\n]*-(itemtype|type)\s+(symboliclink|hardlink|junction)\b/i },
   { name: "creating a link (fsutil hardlink)", re: /\bfsutil\b[^\n]*\bhardlink\b/i },
   { name: "xargs rm", re: /\bxargs\b[^\n]*\b(rm|del|rmdir)\b/i },
-  { name: "mirror/purge delete", re: /\b(rsync\b[^\n]*--delete|robocopy\b[^\n]*\s\/(mir|purge)\b)/i },
+  { name: "rsync --delete", re: /\brsync\b[^\n]*--delete/i },
+  { name: "robocopy /mir or /purge", re: /\brobocopy\b[^\n]*\s\/(mir|purge)\b/i },
   { name: "download tool", re: /\b(certutil\b[^\n]*-urlcache|bitsadmin|start-bitstransfer)\b/i },
   { name: "network transfer (scp/nc)", re: /(^|[\s;&|(`])(scp|nc|ncat|netcat)(\s|$)/i },
   { name: "iex / Invoke-Expression", re: /(^|[\s;&|(`])(iex|invoke-expression)(\s|$|\()/i },
@@ -233,10 +239,8 @@ const SEGMENT_RULES: Rule[] = [
     re: />>?\s*['"]?[^\s'"]*(\.env\b|\.pem\b|\.key\b|\.pfx\b|\.p12\b|id_rsa|\.ssh[\\/]|\.npmrc\b|\.git[\\/]|\.vscode[\\/]|package\.json\b|\.husky[\\/]|\.github[\\/]workflows|node_modules[\\/]\.bin)/i,
   },
   { name: "home directory (~)", re: /(^|[\s='":(])~([\\/]|\s|$)/ },
-  {
-    name: "home directory variable",
-    re: /(%userprofile%|%homepath%|%homedrive%|%appdata%|%localappdata%|\$\{?home\}?|\$env:(userprofile|home|appdata|localappdata))/i,
-  },
+  // Home-directory variables ($HOME, %USERPROFILE%) are covered by the shell-aware expansion check, which runs first;
+  // matching them here as text would also catch harmless literal mentions (single quotes, $HOME under cmd.exe).
 ];
 
 // Whole-line rules: they span a pipe, so they run before the line is split.
@@ -293,7 +297,8 @@ function splitSegments(cmd: string): string[] {
       cur += c;
       continue;
     }
-    const redirectAmp = c === "&" && (cmd[i - 1] === ">" || cmd[i + 1] === ">" || cmd[i - 1] === "<");
+    const redirectAmp =
+      (c === "&" && (cmd[i - 1] === ">" || cmd[i + 1] === ">" || cmd[i - 1] === "<")) || (c === "|" && cmd[i - 1] === ">");
     if (!redirectAmp && (c === ";" || c === "&" || c === "|" || c === "\n" || c === "\r" || c === "(" || c === ")" || c === "`")) {
       if (cur.trim()) out.push(cur.trim());
       cur = "";
@@ -360,16 +365,44 @@ function outsideWorkspacePath(seg: string, root: string): string | undefined {
   return undefined;
 }
 
+const seqCache = new Map<Rule, RegExp[] | null>();
+
+/**
+ * Does the rule match? A rule written as `A[^\n]*B[^\n]*C` is checked as "A, then later B, then later C" with one
+ * forward scan per part. That is equivalent (the earliest match of each part is the best choice) but linear, where the
+ * single backtracking regex is quadratic on input like "rm rm rm ...".
+ */
+function ruleMatches(r: Rule, text: string): boolean {
+  let parts = seqCache.get(r);
+  if (parts === undefined) {
+    const src = r.re.source;
+    try {
+      parts = src.includes("[^\\n]*") ? src.split("[^\\n]*").map((p) => new RegExp(p, r.re.flags.replace(/[gy]/g, ""))) : null;
+    } catch {
+      parts = null; // a part is not a valid regex on its own (the split cut through a group): use the whole rule
+    }
+    seqCache.set(r, parts);
+  }
+  if (!parts) return r.re.test(text);
+  let rest = text;
+  for (const part of parts) {
+    const m = part.exec(rest);
+    if (!m) return false;
+    rest = rest.slice(m.index + m[0].length);
+  }
+  return true;
+}
+
 /** Hard rules on one command string. Returns the rule that fired. */
 function hardRule(cmd: string, root: string): string | undefined {
   for (const line of cmd.split(/\r?\n/)) {
-    for (const r of LINE_RULES) if (r.re.test(line)) return r.name;
+    for (const r of LINE_RULES) if (ruleMatches(r, line)) return r.name;
   }
   for (const seg of splitSegments(cmd)) {
     const word = firstWord(seg);
     if (DANGEROUS_FIRST_WORDS.has(word) || /^mkfs\./.test(word)) return `command "${word}"`;
     if (word === "reg" && /\breg(\.exe)?\s+(add|delete)\b/i.test(seg)) return "registry change (reg add/delete)";
-    for (const r of SEGMENT_RULES) if (r.re.test(seg)) return r.name;
+    for (const r of SEGMENT_RULES) if (ruleMatches(r, seg)) return r.name;
     const outside = outsideWorkspacePath(seg, root);
     if (outside) return `path outside the workspace (${outside.slice(0, 60)})`;
   }
@@ -378,13 +411,57 @@ function hardRule(cmd: string, root: string): string | undefined {
 
 // ---- expansion and escapes ----
 
-function expansionIn(cmd: string): string | undefined {
-  if (/\$/.test(cmd)) return "shell expansion ($)";
-  if (/`/.test(cmd)) return "shell expansion (backtick)";
-  if (/%[A-Za-z_][A-Za-z0-9_]*%/.test(cmd)) return "variable expansion (%VAR%)";
-  if (/![A-Za-z_][A-Za-z0-9_]*!/.test(cmd)) return "variable expansion (!VAR!)";
-  if (/\^/.test(cmd)) return "escape character (^)";
+/** The shell run_command uses: cmd.exe on Windows, /bin/sh elsewhere (spawn with shell: true). */
+export type ShellKind = "cmd" | "posix" | "both";
+// On Windows spawn uses %ComSpec%; if that is not cmd.exe, apply both cmd's and POSIX's expansion rules.
+const DEFAULT_SHELL: ShellKind =
+  process.platform === "win32"
+    ? path.basename(process.env.ComSpec ?? "cmd.exe").toLowerCase() === "cmd.exe"
+      ? "cmd"
+      : "both"
+    : "posix";
+
+/**
+ * Expansion the shell that actually runs the command would perform. Only real expansion counts:
+ * cmd.exe treats `$` and backticks as plain text, and sh never expands inside single quotes.
+ */
+function expansionIn(cmd: string, shell: ShellKind = DEFAULT_SHELL): string | undefined {
   if (/[A-Za-z0-9_](""|'')[A-Za-z0-9_]/.test(cmd)) return "quote-splitting in a word";
+  if (shell === "both") return expansionIn(cmd, "cmd") ?? expansionIn(cmd, "posix");
+  if (shell === "cmd") {
+    // cmd expands %VAR% even inside double quotes (names may contain parentheses: %ProgramFiles(x86)%);
+    // ^ escapes (r^m) are only special outside them.
+    if (/%[A-Za-z_][A-Za-z0-9_()]*(:[^%]*)?%/.test(cmd)) return "variable expansion (%VAR%)";
+    let inDouble = false;
+    for (const ch of cmd) {
+      if (ch === '"') inDouble = !inDouble;
+      else if (ch === "^" && !inDouble) return "escape character (^)";
+    }
+    return undefined;
+  }
+  // POSIX sh: $NAME, ${…}, $(…) and backticks expand outside single quotes (also inside double quotes).
+  // Special parameters like $1, $?, $$ only produce short values, so they don't count.
+  let q: "" | "'" | '"' = "";
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (q === "'") {
+      if (ch === "'") q = "";
+      continue;
+    }
+    if (ch === "\\") {
+      const next = cmd[i + 1];
+      // Outside quotes a backslash can spell a name (.\env -> .env). Inside double quotes it only escapes $ ` " \ and newline.
+      // Escaping a special character (\$ \" \\) just yields that character; escaping a name character spells a name.
+      if (q === "" && next !== undefined && /[A-Za-z0-9_.\-/~]/.test(next)) return "backslash escape";
+      i++; // an escaped character is literal
+      continue;
+    }
+    if (ch === "$" && q === "" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) return "ANSI-C or locale quoting ($'...')";
+    if (ch === "'" && q === "") q = "'";
+    else if (ch === '"') q = q === '"' ? "" : '"';
+    else if (ch === "`") return "shell expansion (backtick)";
+    else if (ch === "$" && /[A-Za-z_{(]/.test(cmd[i + 1] ?? "")) return "shell expansion ($)";
+  }
   return undefined;
 }
 
@@ -550,6 +627,68 @@ function buildToolRule(word: string, a: string[]): string | undefined {
 
 type SegVerdict = { v: "allow"; rule: string } | { v: "classify"; scriptBody?: string } | { v: "ask"; rule: string };
 
+const SHELL_WORDS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd", "eval", "source"]);
+
+/**
+ * If the segment starts with wrapper commands, return the command they run (tokens), "ask" for eval / xargs sh,
+ * or undefined when there is no wrapper.
+ */
+function unwrapCommand(tokens: string[], strict = true): string[] | "ask" | undefined {
+  let i = 0;
+  let changed = false;
+  const isVar = (x: string | undefined) => !!x && /^[A-Za-z_][A-Za-z0-9_]*=/.test(x);
+  for (let guard = 0; guard < 8 && i < tokens.length; guard++) {
+    while (isVar(tokens[i])) {
+      i++;
+      changed = true;
+    }
+    const w = baseWord(tokens[i] ?? "");
+    if (w === "eval") {
+      if (strict) return "ask";
+      i++;
+      changed = true;
+      continue;
+    }
+    if (["command", "nohup", "time", "exec", "setsid", "builtin", "busybox"].includes(w)) {
+      i++;
+      changed = true;
+    } else if (w === "env") {
+      i++;
+      changed = true;
+      while (i < tokens.length && (tokens[i].startsWith("-") || isVar(tokens[i]))) i += ["-u", "-C", "-S", "--unset", "--chdir"].includes(tokens[i]) ? 2 : 1;
+    } else if (w === "timeout") {
+      i++;
+      changed = true;
+      while (i < tokens.length && tokens[i].startsWith("-")) i += ["-s", "-k", "--signal", "--kill-after"].includes(tokens[i]) ? 2 : 1;
+      i++; // the duration
+    } else if (w === "nice") {
+      i++;
+      changed = true;
+      while (i < tokens.length && tokens[i].startsWith("-")) i += tokens[i] === "-n" ? 2 : 1;
+    } else if (w === "ionice") {
+      i++;
+      changed = true;
+      while (i < tokens.length && tokens[i].startsWith("-")) i += ["-c", "-n", "-p", "-P", "-u"].includes(tokens[i]) ? 2 : 1;
+    } else if (w === "stdbuf") {
+      i++;
+      changed = true;
+      while (i < tokens.length && tokens[i].startsWith("-")) i += /^-[ioe]$/.test(tokens[i]) ? 2 : 1;
+    } else if (w === "xargs") {
+      i++;
+      changed = true;
+      while (i < tokens.length && tokens[i].startsWith("-")) i += ["-n", "-I", "-P", "-L", "-d", "-s", "-E", "-a"].includes(tokens[i]) ? 2 : 1;
+      if (strict && SHELL_WORDS.has(baseWord(tokens[i] ?? ""))) return "ask";
+    } else {
+      break;
+    }
+  }
+  if (!changed) return undefined;
+  const rest = tokens.slice(i);
+  if (rest.length === 0) return undefined;
+  if (strict && SHELL_WORDS.has(baseWord(rest[0]))) return "ask";
+  return rest;
+}
+
 function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: number, cwd: string = root): SegVerdict {
   const cleaned = stripBenignRedirects(seg).trim();
   const rawTokens = tokenize(cleaned);
@@ -577,6 +716,16 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
     } else {
       tokens.push(...alts);
     }
+  }
+
+  // Wrapper commands (env, command, nohup, time, timeout, nice, stdbuf, setsid, exec, xargs) run what follows: judge that instead.
+  const unwrapped = unwrapCommand(tokens);
+  if (unwrapped === "ask") return { v: "ask", rule: "eval or a wrapper that runs a shell" };
+  if (unwrapped) {
+    const rest = unwrapped.join(" ");
+    const hard = hardRule(rest, root);
+    if (hard) return { v: "ask", rule: hard };
+    return judgeSegment(rest, root, ctx, depth + 1, cwd);
   }
 
   // Skip VAR=value prefixes for the command word.
@@ -828,11 +977,12 @@ function judge(command: string, root: string, ctx: PolicyContext, depth: number,
   if (typeof command !== "string") return { verdict: "ask", rule: "command is not text" };
   // Fold lookalike characters and drop invisible ones so they can't hide a keyword.
   command = command.normalize("NFKC").replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g, "");
+  if (command.length > MAX_COMMAND_CHARS) return { verdict: "ask", rule: `command is longer than ${MAX_COMMAND_CHARS} characters` };
   if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(command)) return { verdict: "ask", rule: "control characters in the command" };
   if (splitSegments(command).length > 40) return { verdict: "ask", rule: "too many chained commands" };
   if (command.length > MAX_COMMAND_CHARS) return { verdict: "ask", rule: `command is longer than ${MAX_COMMAND_CHARS} characters` };
   if (!command.trim()) return { verdict: "ask", rule: "empty command" };
-  const exp = expansionIn(command);
+  const exp = expansionIn(command, ctx.shell);
   if (exp) return { verdict: "ask", rule: exp };
   if (unbalancedQuotes(command)) return { verdict: "ask", rule: "unbalanced quotes" };
   if ((command.match(/\{/g) ?? []).length !== (command.match(/\}/g) ?? []).length) return { verdict: "ask", rule: "unbalanced braces" };
@@ -888,7 +1038,12 @@ function judge(command: string, root: string, ctx: PolicyContext, depth: number,
  * `ask` = needs the user (hard rule, expansion characters, inline code, a file written this session, ...).
  */
 export function checkCommand(command: string, root: string, ctx: PolicyContext = { written: new Set() }): CommandVerdict {
-  return judge(command, root, ctx, 0);
+  const r = judge(command, root, ctx, 0);
+  // The safety check only sees the first CLASSIFIER_CHARS characters, so it can't vouch for a longer command.
+  if (r.verdict === "classify" && typeof command === "string" && command.length > CLASSIFIER_CHARS) {
+    return { verdict: "ask", rule: `command is too long for the safety check (${command.length} characters)` };
+  }
+  return r;
 }
 
 /** Files a command is about to create or overwrite (redirects, tee, cp/mv, curl -o, wget -O). For the written-file rule. */
@@ -967,4 +1122,548 @@ export function packageJsonRisk(oldContent: string | undefined, newContent: stri
     return `changes "${k}"`;
   }
   return undefined;
+}
+
+// ---- Ultra mode: a tiny backstop ----
+
+export type UltraVerdict = { verdict: "allow" } | { verdict: "ask"; rule: string };
+
+const ULTRA_DISK_WORDS = new Set([
+  "format", "diskpart", "mkfs", "dd", "fdisk", "sfdisk", "parted", "wipefs", "shutdown", "reboot", "halt", "poweroff", "bcdedit",
+  "set-executionpolicy", "setx", "sudo", "su", "runas", "doas", "stop-computer", "restart-computer", "format-volume", "clear-disk",
+  "remove-partition", "initialize-disk", "regedit", "bootrec", "killall5", "lvremove", "vgremove", "pvremove", "telinit",
+]);
+const ULTRA_DELETE = new Set(["rm", "rmdir", "rd", "del", "erase", "remove-item", "ri", "unlink", "shred"]);
+const ULTRA_MOVE = new Set(["mv", "move", "ren", "rename", "move-item", "mi"]);
+const ULTRA_COPY = new Set(["cp", "copy", "xcopy", "rsync", "copy-item", "cpi"]);
+const ULTRA_WRITE = new Set(["tee", "set-content", "add-content", "out-file", "sc", "ac", "truncate", "touch", "mkdir", "md", "ni", "new-item", "ln", "mklink", "install"]);
+const ULTRA_CHMOD = new Set(["chmod", "chown", "chgrp"]);
+const ULTRA_ATTR = new Set(["icacls", "takeown", "attrib", "cipher", "fsutil", "cacls"]);
+const CONTROL_WORDS = new Set(["do", "then", "else", "while", "until", "{", "!", "time", "coproc"]);
+const CLOSER_WORDS = new Set(["fi", "done", "}", "esac", "in", "for", "case", "select", "function"]);
+const EXPANSION_IN_TARGET = /[$`]|%[A-Za-z_(]|^~/;
+const REGISTRY_PATH = /^(hk(lm|cu|cr|u|cc)|registry:)/i;
+const SECRET_NAME_IN_TEXT =
+  /(^|[^\w.-])(\.env(?:\.[\w.-]*)?|id_(?:rsa|dsa|ecdsa|ed25519)|\.npmrc|\.pypirc|_?\.?netrc|\.git-credentials|\.pgpass|\.htpasswd|\.aws[\\/]credentials|credentials\.json|[\w.-]+\.(?:pem|pfx|p12|key|kdbx|tfstate|tfvars))(?=$|[^\w.-])/gi;
+const INLINE_CODE = /\b(node|nodejs|deno|bun)\b[^|;&]*\s(-e|--eval|-p|--print)\b|\b(python3?|py)\b[^|;&]*\s-c\b|\bperl\b[^|;&]*\s-[eE]\b|\bruby\b[^|;&]*\s-e\b|\bphp\b[^|;&]*\s-r\b|\b(powershell|pwsh)\b|\[io\.file\]|\bcmd\b[^|;&]*\s\/[ck]\b/i;
+
+function hasAnsiCQuoting(cmd: string): boolean {
+  let q = "";
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (q === "'") {
+      if (ch === "'") q = "";
+    } else if (ch === "\\") {
+      i++;
+    } else if (ch === "$" && q === "" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
+      return true;
+    } else if (ch === "'" && q === "") {
+      q = "'";
+    } else if (ch === '"') {
+      q = q === '"' ? "" : '"';
+    }
+  }
+  return false;
+}
+
+/** Expand {a,b} / {1..3} words in a whole command; undefined if an expansion is too large. */
+function expandBracesText(command: string): string | undefined {
+  if (!/\{[^{}]*(,|\.\.)[^{}]*\}/.test(command)) return command;
+  let tooBig = false;
+  const out = command.replace(/\S+/g, (w, offset: number, whole: string) => {
+    if (!/\{[^{}]*(,|\.\.)[^{}]*\}/.test(w)) return w;
+    const alts = braceExpand(w);
+    if (!alts) {
+      tooBig = true;
+      return w;
+    }
+    const prev = whole.slice(0, offset).trimEnd().split(/\s+/).pop() ?? "";
+    if (prev.startsWith("-") && !prev.includes("=") && alts.length > 1) {
+      return [alts[0], ...alts.slice(1).map((a) => `${prev} ${a}`)].join(" ");
+    }
+    return alts.join(" ");
+  });
+  return tooBig ? undefined : out;
+}
+
+/**
+ * Pull `$(...)` and `` `...` `` substitutions out of a command: their bodies run too, so they are checked on their own.
+ * The outer command keeps a `$SUB` placeholder, which counts as an expansion in any target position.
+ */
+function peelSubstitutions(cmd: string): { outer: string; inner: string[] } | undefined {
+  const inner: string[] = [];
+  let outer = cmd;
+  for (let round = 0; round < 8; round++) {
+    const before = outer;
+    outer = outer
+      .replace(/`([^`]*)`/g, (_m, body: string) => {
+        inner.push(body);
+        return "$SUB";
+      })
+      .replace(/\$\(([^()]*)\)/g, (_m, body: string) => {
+        inner.push(body);
+        return "$SUB";
+      });
+    if (outer === before) return { outer, inner };
+  }
+  return undefined; // nested too deeply
+}
+
+const ultraAsk = (rule: string): UltraVerdict => ({ verdict: "ask", rule });
+
+/** Commands that destroy remote or cloud resources, or hand a container the host's disk. Returns the reason. */
+const GLOBAL_VALUE_OPTIONS: Record<string, string[]> = {
+  aws: ["--profile", "--region", "--endpoint-url", "--output", "--query", "--ca-bundle", "--cli-read-timeout", "--cli-connect-timeout"],
+  gh: ["-r", "--repo", "--hostname"],
+  docker: ["-h", "--host", "--context", "-c", "--config", "-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey"],
+  podman: ["-h", "--host", "--connection", "-c", "--url", "--log-level", "--root", "--runroot"],
+  nerdctl: ["-h", "--host", "-a", "--address", "-n", "--namespace", "--cgroup-manager"],
+  gsutil: ["-o", "-h", "-u"],
+  kubectl: ["-n", "--namespace", "--context", "--cluster", "--user", "--kubeconfig", "-s", "--server", "--as"],
+  helm: ["-n", "--namespace", "--kube-context", "--kubeconfig"],
+};
+
+/** Positional words of a command, skipping global options and their values (`aws --profile p s3 rm ...` -> s3 rm ...). */
+function subcommandWords(word: string, lower: string[]): string[] {
+  const valueOpts = GLOBAL_VALUE_OPTIONS[word] ?? [];
+  const out: string[] = [];
+  for (let i = 0; i < lower.length; i++) {
+    const a = lower[i];
+    if (a.startsWith("-")) {
+      if (valueOpts.includes(a) && !a.includes("=")) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function cloudDestroyRule(word: string, args: string[], lower: string[]): string | undefined {
+  const has = (x: string) => lower.includes(x);
+  const sub = subcommandWords(word, lower);
+  switch (word) {
+    case "terraform":
+    case "tofu":
+    case "terragrunt":
+      if (has("destroy") || lower.some((a) => a === "-destroy" || a === "--destroy" || a.startsWith("-destroy="))) return `${word} destroy`;
+      return undefined;
+    case "kubectl":
+    case "oc":
+    case "k3s":
+    case "microk8s":
+      return has("delete") || sub.includes("delete") ? `${word} delete` : undefined;
+    case "helm":
+      return has("uninstall") || has("delete") || has("del") ? "helm uninstall" : undefined;
+    case "aws":
+      if (sub[0] === "s3" && sub[1] === "rb") return "aws s3 rb";
+      if (sub[0] === "s3" && sub[1] === "rm" && (has("--recursive") || has("--include") || has("--exclude"))) return "aws s3 rm --recursive";
+      if (lower.some((a) => /^(delete|remove|terminate|deregister|destroy|purge|disable)-/.test(a))) return "aws delete/terminate call";
+      return undefined;
+    case "az":
+      return has("delete") ? "az ... delete" : undefined;
+    case "gcloud":
+    case "gsutil":
+      if (has("delete") || sub.includes("delete")) return `${word} delete`;
+      if (word === "gsutil" && sub[0] === "rm" && (lower.some((a) => /^-[a-z]*r[a-z]*$/.test(a)) || args.some((a) => /[*?]/.test(a)))) return "gsutil rm (recursive or wildcard)";
+      return undefined;
+    case "gh":
+      return sub[0] === "repo" && (sub[1] === "delete" || sub[1] === "archive") ? "gh repo delete" : undefined;
+    case "docker":
+    case "podman":
+    case "nerdctl": {
+      if (sub[0] === "system" && sub[1] === "prune" && lower.some((a) => a === "--all" || a === "--volumes" || /^-[a-z]*a[a-z]*$/.test(a))) return `${word} system prune -a/--volumes`;
+      if (sub[0] === "volume" && sub[1] === "prune") return `${word} volume prune`;
+      if (sub[0] === "run" || sub[0] === "create") {
+        if (lower.some((a) => /^--privileged(=(true|1|yes))?$/.test(a))) return `${word} run --privileged`;
+        if (lower.some((a) => /^--(pid|ipc|uts|userns|network|net)=host$/.test(a) && !/^--(network|net)=host$/.test(a))) return `${word} run shares a host namespace`;
+        for (let i = 0; i < lower.length; i++) {
+          const capv = lower[i] === "--cap-add" ? lower[i + 1] : /^--cap-add=/.test(lower[i]) ? lower[i].slice(lower[i].indexOf("=") + 1) : undefined;
+          if (capv !== undefined && /^(all|sys_admin|sys_module|sys_rawio|sys_ptrace)$/.test(capv)) return `${word} run adds dangerous capabilities`;
+          const secv = lower[i] === "--security-opt" ? lower[i + 1] : /^--security-opt=/.test(lower[i]) ? lower[i].slice(lower[i].indexOf("=") + 1) : undefined;
+          if (secv !== undefined && /unconfined/.test(secv)) return `${word} run disables a security profile`;
+          if (lower[i] === "--pid" || lower[i] === "--ipc" || lower[i] === "--userns") if (lower[i + 1] === "host") return `${word} run shares a host namespace`;
+        }
+        for (let i = 0; i < args.length; i++) {
+          let v: string | undefined;
+          if (lower[i] === "-v" || lower[i] === "--volume" || lower[i] === "--mount") v = args[i + 1];
+          else if (/^--(volume|mount)=/i.test(args[i])) v = args[i].slice(args[i].indexOf("=") + 1);
+          else if (/^-v./.test(args[i])) v = args[i].slice(2);
+          if (v === undefined) continue;
+          const src = /(?:^|,)(?:src|source)=([^,]+)/i.exec(v)?.[1] ?? v;
+          if (/^(\/|[A-Za-z]:[\\/]?)(:|$)/.test(src) || /^\/(etc|root|home|var|usr|bin|sys|proc|dev|boot|lib)?(:|$)/.test(src)) {
+            return `${word} run mounts the host's root or system folders`;
+          }
+          if (/\/var\/run\/docker\.sock/.test(v)) return `${word} run mounts the container socket`;
+          // home folder or an unresolvable variable as the source (the workspace itself is $PWD / ${PWD} / %cd% / ./ / a $(...) result)
+          if (/^~/.test(src)) return `${word} run mounts the home folder`;
+          if (/[$%]/.test(src) && !/^(\$PWD|\$\{PWD\}|\$SUB|%cd%)(\/|\\|:|$)/i.test(src)) return `${word} run mounts a path built from a variable`;
+        }
+      }
+      return undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** Strip leading control-flow words and cmd's `if ... ` prefixes so the real command is judged. */
+/** Does this folder (a few levels down, skipping node_modules and .git) contain a secret file? */
+function folderHoldsSecret(dir: string): boolean {
+  let budget = 2000;
+  const walk = (d: string, depth: number): boolean => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const e of entries) {
+      if (--budget < 0) return false;
+      if (isSecretFile(e.name)) return true;
+      if (e.isDirectory() && depth < 3 && e.name !== "node_modules" && e.name !== ".git" && walk(path.join(d, e.name), depth + 1)) return true;
+    }
+    return false;
+  };
+  try {
+    if (fs.statSync(dir).isFile()) return isSecretFile(dir);
+  } catch {
+    return false;
+  }
+  return walk(dir, 0);
+}
+
+function stripControlPrefix(tokens: string[]): string[] {
+  let t = tokens;
+  for (let guard = 0; guard < 10 && t.length > 0; guard++) {
+    const w = t[0].toLowerCase();
+    if (w === "if" || w === "elif") {
+      t = t.slice(1);
+      // cmd: if [/i] [not] exist X | defined X | errorlevel N | a==b | a EQU b  <command>
+      let i = 0;
+      if (t[i]?.toLowerCase() === "/i") i++;
+      if (t[i]?.toLowerCase() === "not") i++;
+      const k = t[i]?.toLowerCase();
+      if (k === "exist" || k === "defined" || k === "errorlevel" || k === "cmdextversion") t = t.slice(i + 2);
+      else if (t[i] !== undefined && t[i].includes("==")) t = t.slice(i + 1);
+      else if (t[i + 1] === "==" || ["equ", "neq", "lss", "leq", "gtr", "geq"].includes((t[i + 1] ?? "").toLowerCase())) t = t.slice(i + 3);
+      // otherwise (posix) the condition is itself a command: keep it
+    } else if (CONTROL_WORDS.has(w)) {
+      t = t.slice(1);
+    } else {
+      break;
+    }
+  }
+  return t;
+}
+
+function backstop(command: string, root: string, ctx: PolicyContext, depth: number, cwd0: string, cwdKnown0 = true): UltraVerdict {
+  let cwd = cwd0;
+  let cwdKnown = cwdKnown0;
+  if (typeof command !== "string") return ultraAsk("command is not text");
+  command = command.normalize("NFKC").replace(/[​-‏‪-‮⁠-⁤﻿]/g, "");
+  if (command.length > MAX_COMMAND_CHARS) return ultraAsk(`command is longer than ${MAX_COMMAND_CHARS} characters`);
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(command)) return ultraAsk("control characters in the command");
+  if (depth > MAX_SCRIPT_DEPTH + 2) return ultraAsk("commands nested too deeply");
+  const shell = ctx.shell ?? DEFAULT_SHELL;
+  const posix = shell !== "cmd";
+  if (posix && hasAnsiCQuoting(command)) return ultraAsk("ANSI-C or locale quoting ($'...')");
+  if (/:\s*\(\s*\)\s*\{/.test(command)) return ultraAsk("fork bomb");
+
+  // Secret names anywhere in the text when the command runs inline code (node -e, python -c, PowerShell ...).
+  if (INLINE_CODE.test(command)) {
+    for (const m of command.matchAll(SECRET_NAME_IN_TEXT)) {
+      if (isSecretFile(m[2])) return ultraAsk(`inline code mentions a secrets file (${m[2].slice(0, 40)})`);
+    }
+  }
+
+  // Command substitutions run too: check their bodies, and treat the outer position as an expansion.
+  if (posix) {
+    const peeled = peelSubstitutions(command);
+    if (!peeled) return ultraAsk("command substitutions nested too deeply");
+    for (const body of peeled.inner) {
+      const r = backstop(body, root, ctx, depth + 1, cwd, cwdKnown);
+      if (r.verdict === "ask") return r;
+    }
+    command = peeled.outer;
+  }
+
+  if (unbalancedQuotes(command) || (command.match(/\{/g) ?? []).length !== (command.match(/\}/g) ?? []).length) {
+    return ultraAsk("unbalanced quotes or braces");
+  }
+  const expanded = expandBracesText(command);
+  if (expanded === undefined) return ultraAsk("large brace expansion");
+  command = expanded;
+  if (splitSegments(command).length > 200) return ultraAsk("too many chained commands");
+
+  const unescape = (x: string) => (posix ? x.replace(/\\(.)/g, "$1") : x);
+  const stripRef = (x: string) => x.replace(/^(@|<|file:\/\/)/i, "");
+  const resolveTarget = (x: string) => path.resolve(cwd, unescape(x));
+  const outside = (x: string) => {
+    if (/^~/.test(x)) return true;
+    const abs = /^([A-Za-z]:|[\\/])/.test(x);
+    if (!cwdKnown && !abs) return true; // relative to a folder we could not work out (cd ~, cd with no argument)
+    return !isInside(resolveTarget(x), root);
+  };
+
+  for (const seg of splitSegments(command)) {
+    // Redirects and other writes outside the workspace, or aimed through an expansion.
+    for (const m of seg.matchAll(/(?:^|\s)\d?>(?:>|\|)?\s*([^\s<>|&]+)/g)) {
+      const target = m[1];
+      if (target === "/dev/null" || target.toLowerCase() === "nul" || target.startsWith("&")) continue;
+      if (EXPANSION_IN_TARGET.test(target)) return ultraAsk("redirect target is built from an expansion");
+      if (outside(target)) return ultraAsk(`redirect writes outside the workspace (${target.slice(0, 60)})`);
+    }
+    for (const w of writeTargets(seg, cwd)) {
+      if (!isInside(w, root) || !cwdKnown) return ultraAsk("writes outside the workspace");
+    }
+
+    let rawTokens = tokenize(seg);
+    if (rawTokens.length === 0) continue;
+    rawTokens = stripControlPrefix(rawTokens);
+    if (rawTokens.length === 0) continue;
+    if (CLOSER_WORDS.has(rawTokens[0].toLowerCase()) && rawTokens.length === 1) continue;
+    if (posix && !/^([A-Za-z]:|\.\\|\\\\)/.test(rawTokens[0])) rawTokens[0] = unescape(rawTokens[0]); // r\m -> rm
+    if (baseWord(rawTokens[0]) === "eval") {
+      const r = backstop(rawTokens.slice(1).join(" "), root, ctx, depth + 1, cwd, cwdKnown);
+      if (r.verdict === "ask") return r;
+      continue;
+    }
+    let tokens = rawTokens;
+    const unwrapped = unwrapCommand(tokens, false);
+    let viaXargs = false;
+    if (unwrapped && unwrapped !== "ask") {
+      viaXargs = rawTokens.slice(0, rawTokens.length - unwrapped.length).some((x) => baseWord(x) === "xargs");
+      tokens = unwrapped;
+    }
+    const word = baseWord(tokens[0] ?? "");
+    const args = tokens.slice(1);
+    const lower = args.map((a) => a.toLowerCase());
+    const nonFlags = args.filter((a) => !a.startsWith("-") && !/^\/[A-Za-z?]$/.test(a));
+
+    // Nested commands: bash -c "...", cmd /c ..., powershell -Command ...
+    let inner: string | undefined;
+    if (["sh", "bash", "zsh", "dash", "ksh", "fish"].includes(word)) {
+      const ci = args.findIndex((a) => /^-[a-z]*c[a-z]*$/i.test(a));
+      if (ci >= 0) inner = args.slice(ci + 1).join(" ");
+    } else if (word === "cmd") {
+      const ci = lower.findIndex((a) => a === "/c" || a === "/k");
+      if (ci >= 0) inner = args.slice(ci + 1).join(" ");
+    } else if (word === "powershell" || word === "pwsh") {
+      const ci = lower.findIndex((a) => a === "-c" || a === "-command");
+      if (ci >= 0) inner = args.slice(ci + 1).join(" ");
+      if (lower.some((a) => ["-enc", "-ec", "-encodedcommand"].includes(a)) || lower.some((a) => /^-e[a-z]*$/.test(a) && a !== "-executionpolicy")) {
+        return ultraAsk("encoded PowerShell command");
+      }
+    }
+    if (inner !== undefined) {
+      const r = backstop(inner, root, ctx, depth + 1, cwd, cwdKnown);
+      if (r.verdict === "ask") return r;
+    }
+
+    // Disk and OS level.
+    if (ULTRA_DISK_WORDS.has(word) || /^mkfs\./.test(word)) return ultraAsk(`disk or system command "${word}"`);
+    if (word === "reg" && /^(add|delete|import)$/i.test(args[0] ?? "")) return ultraAsk("registry change (reg add/delete/import)");
+    if (word === "init" && /^[06]$/.test(args[0] ?? "")) return ultraAsk("init changes the run level (shutdown/reboot)");
+    if (word === "systemctl" && /^(poweroff|reboot|halt|kexec|hibernate|suspend|hybrid-sleep)$/.test(lower[0] ?? "")) return ultraAsk("systemctl power command");
+    if ((word === "vssadmin" || word === "wbadmin") && lower.some((a) => a === "delete")) return ultraAsk(`${word} delete`);
+    if (word === "sc" && lower[0] === "delete") return ultraAsk("sc delete");
+    if (word === "net" && ["user", "localgroup", "accounts"].includes(lower[0] ?? "") && lower.some((a) => a === "/add" || a === "/delete")) return ultraAsk("net user/group change");
+    if (word === "crontab" && lower.includes("-r")) return ultraAsk("crontab -r");
+    if (word === "zpool" && lower.includes("destroy")) return ultraAsk("zpool destroy");
+    if (word === "kill" && lower.some((a, i) => (a === "-9" || a === "-kill" || a === "-sigkill") && /^(1|-1)$/.test(lower[i + 1] ?? ""))) return ultraAsk("kill pid 1 / all processes");
+    if (word === "cipher" && lower.some((a) => a.startsWith("/w"))) return ultraAsk("cipher /w wipes free space");
+    if (/^(set-itemproperty|new-itemproperty|remove-itemproperty|clear-itemproperty|remove-item|new-item|ri|ni|sp|rp)$/.test(word) && args.some((a) => REGISTRY_PATH.test(a.replace(/^-\w+[:=]?/, "")))) {
+      return ultraAsk("registry change through PowerShell");
+    }
+    if (word === "git" && lower.some((a) => a === "config")) {
+      const { sub, args: g } = gitParts(tokens);
+      if (sub === "config" && g.some((a) => ["--list", "-l", "--get-regexp", "--show-origin"].includes(a.toLowerCase()) || /^remote\./.test(a))) {
+        return ultraAsk("git config can reveal token URLs");
+      }
+    }
+    // Destroying remote or cloud resources.
+    {
+      const cloud = cloudDestroyRule(word, args, lower);
+      if (cloud) return ultraAsk(cloud);
+    }
+    // Credential dumps and environment dumps.
+    const sensitiveCli =
+      (word === "gh" && lower[0] === "auth" && lower[1] === "token") ||
+      (word === "gcloud" && lower.some((a) => /print-(access|identity)-token/.test(a))) ||
+      (word === "az" && lower.includes("get-access-token")) ||
+      (word === "aws" && lower[0] === "configure" && lower[1] === "get" && /secret|token|key/.test(lower[2] ?? "")) ||
+      (word === "security" && /^find-(generic|internet)-password$/.test(lower[0] ?? "")) ||
+      (word === "cmdkey" && lower.some((a) => a.startsWith("/list"))) ||
+      word === "vaultcmd" ||
+      (word === "git" && gitParts(tokens).sub === "credential") ||
+      (word === "npm" && lower[0] === "token") ||
+      word === "printenv" ||
+      (word === "env" && args.length === 0) ||
+      (word === "set" && args.length === 0) ||
+      (word === "export" && lower[0] === "-p") ||
+      (word === "declare" && lower.includes("-x")) ||
+      (["get-childitem", "gci", "dir", "ls"].includes(word) && args.some((a) => /^env:/i.test(a)));
+    if (sensitiveCli) return ultraAsk(`dumps credentials or the environment (${word})`);
+
+    if (["cd", "chdir", "pushd", "set-location", "sl"].includes(word)) {
+      const target = nonFlags.filter((a) => a.toLowerCase() !== "/d").pop();
+      // `cd` with no argument, `cd ~`, `cd $HOME`: the folder is not the workspace and we can't say which one it is.
+      if (!target && posix) cwdKnown = false;
+      else if (target && (/^~/.test(target) || target === "-" || EXPANSION_IN_TARGET.test(target))) cwdKnown = false;
+      else if (target) cwd = resolveTarget(target);
+      continue;
+    }
+
+    // find: a start folder outside the workspace with -delete / -exec; the -exec command is judged too.
+    if (word === "find") {
+      const startDirs: string[] = [];
+      for (const a of args) {
+        if (a.startsWith("-") || a === "(" || a === "!") break;
+        startDirs.push(a);
+      }
+      const acts = lower.some((a) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(a));
+      if (acts && (startDirs.length === 0 ? !cwdKnown : startDirs.some((d) => outside(d) || EXPANSION_IN_TARGET.test(d)))) {
+        return ultraAsk("find with -delete/-exec outside the workspace");
+      }
+      const ei = lower.findIndex((a) => a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir");
+      if (ei >= 0) {
+        const cmdToks: string[] = [];
+        for (const a of args.slice(ei + 1)) {
+          if (a === ";" || a === "\\" || a === "+" || a === "\\;") break;
+          cmdToks.push(a);
+        }
+        const r = backstop(cmdToks.filter((a) => a !== "{}").join(" "), root, ctx, depth + 1, cwd, cwdKnown);
+        if (r.verdict === "ask") return r;
+      }
+    }
+
+    // git: remote history, other folders, clone destinations.
+    if (word === "git") {
+      const { sub, args: g } = gitParts(tokens);
+      for (let i = 1; i < tokens.length; i++) {
+        const a = tokens[i];
+        let dir: string | undefined;
+        if (a === "-C" || a === "--work-tree" || a === "--git-dir") dir = tokens[i + 1];
+        else if (/^--(work-tree|git-dir)=/.test(a)) dir = a.slice(a.indexOf("=") + 1);
+        if (dir !== undefined && (EXPANSION_IN_TARGET.test(dir) || outside(dir))) return ultraAsk("git runs against a folder outside the workspace");
+      }
+      if (g.some((a, i) => a === "-C" && g[i + 1] !== undefined && outside(g[i + 1]))) return ultraAsk("git -C folder outside the workspace");
+      if (sub === "clone") {
+        const dest = g.filter((a) => !a.startsWith("-"))[1];
+        if (dest !== undefined && (EXPANSION_IN_TARGET.test(dest) || outside(dest))) return ultraAsk("git clone destination is outside the workspace");
+      }
+      if (sub === "push") {
+        const DANGEROUS_LONG = ["force", "force-with-lease", "force-if-includes", "mirror", "delete", "prune"];
+        const bad = g.find((a) => {
+          if (/^-[a-zA-Z]*[fd][a-zA-Z]*$/.test(a)) return true;
+          if (a.startsWith("--") && a.length > 3) {
+            const name = a.slice(2).split("=")[0].toLowerCase();
+            if (DANGEROUS_LONG.some((o) => o.startsWith(name))) return true;
+          }
+          return false;
+        });
+        if (bad !== undefined) return ultraAsk(`git push ${bad.slice(0, 30)} rewrites or deletes remote history`);
+        // refspecs: +src:dst, src:+dst, :dst (delete)
+        const refspecBad = g.find((a) => !a.startsWith("-") && (a.startsWith("+") || a.startsWith(":") || /:\+/.test(a)));
+        if (refspecBad !== undefined) return ultraAsk(`git push refspec ${refspecBad.slice(0, 30)} forces or deletes a remote ref`);
+      }
+      for (const a of g) {
+        const rp = a.includes(":") && !a.startsWith("-") ? a.slice(a.indexOf(":") + 1) : "";
+        if (rp && isSecretFile(unescape(rp))) return ultraAsk("git reads a secrets file");
+      }
+    }
+
+    // Archives and installers that write somewhere else.
+    if (word === "tar" || word === "bsdtar" || word === "unzip" || word === "expand-archive" || word === "7z" || word === "7za" || word === "7zr") {
+      let dir: string | undefined;
+      for (let i = 0; i < args.length; i++) {
+        const a = lower[i];
+        if (word === "tar" || word === "bsdtar") {
+          if (a === "-c" || a === "--directory") dir = args[i + 1];
+          else if (/^--directory=/.test(a)) dir = args[i].slice(args[i].indexOf("=") + 1);
+        } else if (word === "unzip") {
+          if (a === "-d") dir = args[i + 1];
+        } else if (word === "expand-archive") {
+          if (a === "-destinationpath" || a === "-dest" || a === "-d") dir = args[i + 1];
+        } else if (a.startsWith("-o") && a.length > 2) {
+          dir = args[i].slice(2);
+        }
+        if (dir !== undefined && (EXPANSION_IN_TARGET.test(dir) || outside(dir))) return ultraAsk(`${word} extracts outside the workspace`);
+        dir = undefined;
+      }
+    }
+    // cp/mv -t DIR, install -t DIR
+    {
+      const ti = lower.findIndex((a) => a === "-t" || a === "--target-directory");
+      if (ti >= 0 && args[ti + 1] !== undefined && (EXPANSION_IN_TARGET.test(args[ti + 1]) || outside(args[ti + 1]))) {
+        return ultraAsk("target directory is outside the workspace");
+      }
+    }
+
+    // Delete / move / copy-over / write whose target is outside the workspace, a root, home, or built by expansion.
+    const recursiveFlag = lower.some((a) => /^-[a-z]*r[a-z]*$/.test(a) || a === "--recursive" || a === "/s" || a === "-recurse" || a === "/t");
+    let targets: string[] = [];
+    let kind = "";
+    if (ULTRA_DELETE.has(word)) {
+      targets = nonFlags;
+      kind = "delete";
+    } else if (ULTRA_MOVE.has(word)) {
+      targets = nonFlags;
+      kind = "move";
+    } else if (ULTRA_COPY.has(word)) {
+      targets = nonFlags.slice(-1);
+      kind = "copy";
+    } else if (word === "robocopy") {
+      targets = nonFlags.slice(0, 2);
+      kind = "copy";
+    } else if (ULTRA_WRITE.has(word) || (word === "sed" && lower.some((a) => /^-[a-z]*i/.test(a) || a.startsWith("--in-place")))) {
+      targets = nonFlags;
+      kind = "write";
+    } else if (ULTRA_CHMOD.has(word) && recursiveFlag) {
+      targets = nonFlags.slice(1);
+      kind = "recursive permission change";
+    } else if (ULTRA_ATTR.has(word)) {
+      targets = args.map((a) => a.replace(/^\/[A-Za-z]:/, "")).filter((a) => a !== "" && !a.startsWith("-") && !/^\/[A-Za-z?]+$/.test(a));
+      kind = "permission or attribute change";
+    }
+    if (viaXargs && kind !== "") return ultraAsk(`xargs feeds targets to ${word}: could not check them`);
+    for (const tg of targets) {
+      if (EXPANSION_IN_TARGET.test(tg)) return ultraAsk(`${kind} target is built from an expansion`);
+      if (outside(tg)) return ultraAsk(`${kind} target is outside the workspace (${tg.slice(0, 60)})`);
+      if (kind === "delete" && normalizePath(resolveTarget(tg)) === normalizePath(root)) return ultraAsk("delete target is the whole workspace");
+    }
+    if (kind === "delete" && targets.length === 0 && recursiveFlag && !cwdKnown) return ultraAsk("delete in a folder that could not be worked out");
+
+    // Searches that sweep up secret files: rg --hidden / -u / --no-ignore*, grep -r over a folder containing one.
+    if (word === "rg" && lower.some((a) => a === "--hidden" || a === "--no-ignore" || a.startsWith("--no-ignore-") || /^-u+$/.test(a) || a === "--unrestricted")) {
+      return ultraAsk("rg searches hidden or ignored files");
+    }
+    if (
+      (word === "grep" && lower.some((a) => a === "--recursive" || a === "--dereference-recursive" || /^-[a-z]*r[a-z]*$/.test(a) || a === "--directories=recurse")) ||
+      (word === "findstr" && lower.includes("/s")) ||
+      (["get-childitem", "gci", "select-string", "sls"].includes(word) && lower.some((a) => a === "-recurse" || a === "-r"))
+    ) {
+      const searchWords = ["grep", "findstr", "select-string", "sls"].includes(word);
+      const given = searchWords ? nonFlags.slice(1) : nonFlags; // the first plain argument of a search is its pattern
+      const dirs = given.length > 0 ? given : ["."];
+      for (const d of dirs) if (!/[*?[]/.test(d) && folderHoldsSecret(resolveTarget(d))) return ultraAsk("recursive search over a folder that contains a secrets file");
+    }
+
+    // Secret files (also @file, <file, file:// forms such as curl -d @.env).
+    for (const a of args) {
+      const v = unescape(stripRef(a.includes("=") ? stripRef(a.slice(a.indexOf("=") + 1)) : a));
+      if (!v) continue;
+      if (isSecretFile(v) || /(^|[\\/])\.git[\\/]config$/i.test(v) || (/[*?[]/.test(v) && globTouchesSecret(v, cwd))) return ultraAsk("touches a secrets file");
+    }
+  }
+  return { verdict: "allow" };
+}
+
+/**
+ * Ultra mode: everything runs without a safety check except this backstop. Asks for catastrophic actions only:
+ * deleting / moving / copying over / writing outside the workspace (or a root, home, or an expansion-built target),
+ * force-pushing or deleting remote refs, disk / OS level commands, and reading secret files.
+ */
+export function ultraBackstop(command: string, root: string, ctx: PolicyContext = { written: new Set() }): UltraVerdict {
+  return backstop(command, root, ctx, 0, root);
 }

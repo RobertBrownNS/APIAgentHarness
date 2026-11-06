@@ -37,7 +37,7 @@ export function Header({
         <span className="min-w-0 truncate text-xs font-semibold" title={config.workspaceName}>
           NextAgent{config.workspaceName ? ` · ${config.workspaceName}` : ""}
         </span>
-        <Badge variant={config.mode === "auto" ? "warning" : "outline"} title="Team-wide mode">
+        <Badge variant={config.mode === "ultra" ? "destructive" : config.mode === "auto" ? "warning" : "outline"} title="Team-wide mode">
           {MODE_LABEL[config.mode]} mode
         </Badge>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">

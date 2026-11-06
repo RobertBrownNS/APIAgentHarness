@@ -2,6 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { spawn } from "node:child_process";
 import * as vscode from "vscode";
 import { z } from "zod";
+import { scrubEnv } from "./envFilter";
 import { isSecretEither } from "./secretPaths";
 import { confinePath, displayPath } from "./paths";
 import { findMatches, looksBinary, numberLines, replaceUnique, truncateMiddle } from "./textOps";
@@ -333,7 +334,7 @@ $ ${input.command}`);
       windowsHide: true,
       detached: process.platform !== "win32", // own process group so we can kill the tree
       stdio: ["ignore", "pipe", "pipe"], // stdin at EOF so commands that read it don't hang
-      env: Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("ANTHROPIC_"))),
+      env: scrubEnv(process.env), // no ANTHROPIC_*, AWS_*, *_TOKEN, *_SECRET, *_KEY ... (all modes)
     });
     // Keep the start and a rolling window of the end; errors are usually at the end.
     const HEAD = 1_000_000;

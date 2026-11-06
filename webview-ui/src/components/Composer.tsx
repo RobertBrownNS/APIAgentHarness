@@ -17,26 +17,26 @@ function fmt(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
-function ModeSwitcher({ mode, onPickAuto }: { mode: Mode; onPickAuto: () => void }) {
+function ModeSwitcher({ mode, onPickRisky }: { mode: Mode; onPickRisky: (m: "auto" | "ultra") => void }) {
   return (
     <Select
       value={mode}
       onValueChange={(m) => {
-        // Auto is the riskiest mode: confirm before sending.
-        if (m === "auto" && mode !== "auto") onPickAuto();
+        // Auto and Ultra skip approvals: confirm before sending.
+        if ((m === "auto" || m === "ultra") && m !== mode) onPickRisky(m);
         else post({ type: "setMode", mode: m as Mode });
       }}
     >
       <SelectTrigger
-        className={cn("w-24", mode === "auto" && "border-warning/70 text-warning")}
+        className={cn("w-24", mode === "auto" && "border-warning/70 text-warning", mode === "ultra" && "border-destructive/70 text-destructive")}
         aria-label="Mode (applies to the whole team)"
-        title="Mode for the whole team: Plan is read-only, Normal asks for edits and commands, Auto runs edits and safe commands"
+        title="Mode for the whole team: Plan is read-only, Normal asks for edits and commands, Auto runs edits and safe commands, Ultra runs almost everything without asking"
       >
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
         {MODES.map((m) => (
-          <SelectItem key={m} value={m} className={m === "auto" ? "text-warning" : undefined}>
+          <SelectItem key={m} value={m} className={m === "auto" ? "text-warning" : m === "ultra" ? "text-destructive" : undefined}>
             {MODE_LABEL[m]}
           </SelectItem>
         ))}
@@ -82,7 +82,7 @@ export function Composer({ agent, config }: { agent: AgentInfo; config: SessionC
   const busy = agent.status === "running" || agent.status === "awaiting";
   const [text, setText] = useState(() => loadDraft(name));
   const ref = useRef<HTMLTextAreaElement>(null);
-  const [confirmAuto, setConfirmAuto] = useState(false);
+  const [confirm, setConfirm] = useState<"auto" | "ultra" | null>(null);
 
   useEffect(() => saveDraft(name, text), [name, text]);
 
@@ -103,21 +103,29 @@ export function Composer({ agent, config }: { agent: AgentInfo; config: SessionC
 
   return (
     <div className="shrink-0 border-t p-2">
-      {confirmAuto && config.mode !== "auto" && (
-        <div className="mb-1.5 flex flex-wrap items-center gap-1.5 rounded-md border border-warning/60 px-2 py-1 text-xs">
-          <span className="min-w-0 flex-1 text-warning">
-            Auto runs edits without asking and commands unless a rule or check stops them. Tests and builds run project code, so use Normal for untrusted work.
+      {confirm && config.mode !== confirm && (
+        <div
+          className={cn(
+            "mb-1.5 flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1 text-xs",
+            confirm === "ultra" ? "border-destructive/70" : "border-warning/60",
+          )}
+        >
+          <span className={cn("min-w-0 flex-1", confirm === "ultra" ? "text-destructive" : "text-warning")}>
+            {confirm === "ultra"
+              ? "Ultra runs everything without asking and without a safety check, for the whole team. Only a small backstop still asks: deleting, moving or writing outside the project, force-push or deleting remote git history, destroying cloud or remote resources (terraform destroy, kubectl delete, gh repo delete…), disk and OS-level commands, and reading secret files. Not stopped: publishing packages, piping downloads into a shell, scripts the agent writes, and deletes or history rewrites inside the project. It is not a sandbox; do not use it on untrusted work."
+              : "Auto runs edits without asking and commands unless a rule or check stops them. Tests and builds run project code, so use Normal for untrusted work."}
           </span>
           <Button
             size="sm"
+            variant={confirm === "ultra" ? "destructive" : "default"}
             onClick={() => {
-              post({ type: "setMode", mode: "auto" });
-              setConfirmAuto(false);
+              post({ type: "setMode", mode: confirm });
+              setConfirm(null);
             }}
           >
-            Switch to Auto
+            Switch to {MODE_LABEL[confirm]}
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => setConfirmAuto(false)}>
+          <Button size="sm" variant="ghost" onClick={() => setConfirm(null)}>
             Cancel
           </Button>
         </div>
@@ -145,7 +153,7 @@ export function Composer({ agent, config }: { agent: AgentInfo; config: SessionC
           className="min-h-7"
         />
         <InputGroupAddon align="block-end" className="flex-wrap gap-1.5">
-          <ModeSwitcher mode={config.mode} onPickAuto={() => setConfirmAuto(true)} />
+          <ModeSwitcher mode={config.mode} onPickRisky={setConfirm} />
           <ModelSelect
             className="w-36"
             value={agent.model}
@@ -178,6 +186,33 @@ export function Composer({ agent, config }: { agent: AgentInfo; config: SessionC
           </div>
         </InputGroupAddon>
       </InputGroup>
+      {config.mode === "ultra" && (
+        <div
+          role="alert"
+          className="mt-1 flex items-center gap-1 rounded-md border border-destructive/70 px-2 py-0.5 text-[11px] font-medium text-destructive"
+        >
+          Ultra: runs without asking except catastrophic actions.
+          <HoverCard openDelay={100}>
+            <HoverCardTrigger asChild>
+              <button type="button" className="cursor-help underline underline-offset-2">
+                Details
+              </button>
+            </HoverCardTrigger>
+            <HoverCardContent side="top" className="w-80 space-y-1 text-xs font-normal">
+              <div>
+                <span className="font-medium">Still asks:</span> deleting, moving or writing outside the project; force-push or
+                deleting remote git history; destroying cloud or remote resources (terraform destroy, kubectl delete, gh repo
+                delete…); disk and OS-level commands; reading secret files.
+              </div>
+              <div>
+                <span className="font-medium">Not stopped:</span> publishing packages, piping downloads into a shell, scripts
+                the agent writes, and deletes or history rewrites inside the project.
+              </div>
+              <div className="text-muted-foreground">Not a sandbox. Switch to Normal for untrusted work.</div>
+            </HoverCardContent>
+          </HoverCard>
+        </div>
+      )}
       {config.mode === "auto" && (
         <div className="mt-1 text-[11px] text-warning">
           Auto runs edits without asking and commands unless a rule or check stops them. Tests and builds run project code, so use Normal for untrusted work. Auto is not a sandbox.

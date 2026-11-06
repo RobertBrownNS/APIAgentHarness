@@ -93,7 +93,7 @@ export const flush = async () => {
   for (let i = 0; i < 3; i++) await tick();
 };
 
-export function makeTeam(over: Partial<TeamSettings> = {}, extra: { classify?: CommandClassifier; log?: (l: string) => void; root?: string } = {}) {
+export function makeTeam(over: Partial<TeamSettings> = {}, extra: { classify?: CommandClassifier; log?: (l: string) => void; root?: string; rawDefaultMode?: boolean } = {}) {
   const logs: string[] = [];
   const agents = new Map<string, FakeAgent>();
   const emitted: HostMessage[] = [];
@@ -122,5 +122,15 @@ export function makeTeam(over: Partial<TeamSettings> = {}, extra: { classify?: C
       return a;
     },
   });
+  // A team can only START in plan or normal (the defaultMode setting is clamped); tests that want to start in auto or
+  // ultra switch explicitly, then drop the mode note and marker so they look like a fresh team.
+  if (!extra.rawDefaultMode && (over.defaultMode === "auto" || over.defaultMode === "ultra") && team.mode !== over.defaultMode) {
+    team.setMode(over.defaultMode);
+    for (const a of agents.values()) {
+      team.drainSystemNotes(a.name);
+      a.transcript = a.transcript.filter((i) => i.kind !== "mode");
+    }
+    logs.length = 0;
+  }
   return { team, agents, emitted, settings, logs, lead: agents.get("main")! };
 }

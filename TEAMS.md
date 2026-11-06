@@ -255,6 +255,23 @@ CSS variables map onto our `--vscode-*` tokens):
 8. **Rename:** extension id changes, so SecretStorage can't migrate; drop the agentHarness.apiKey migration and say so in QA.md
    (re-enter the key once). No settings migration (pre-release); QA.md notes it.
 
+## R4: Ultra mode (user decision: "tiny backstop")
+- New team-wide mode `ultra` (protocol.ts `Mode`). Never a default (`defaultMode` stays plan|normal); only reachable through an
+  explicit switch (UI mode switcher with a confirm, or the Set Mode command with a modal warning); not offered by plan approval.
+- In Ultra, `Team.authorize` approves every edit and command **without the classifier**, except `ultraBackstop(command, root, ctx)`
+  in autoPolicy.ts returns ask for:
+  1. recursive delete / move / copy-over / write / redirect whose target is outside the workspace, a drive or filesystem root,
+     the home folder (`~`, `$HOME`, `%USERPROFILE%`), or built from expansion;
+  2. `git push` with `--force`/`-f`/`--force-with-lease`/`--mirror`/`--delete`/`-d`/`+refspec`/`:branch`;
+  3. disk/OS-level: format, diskpart, mkfs*, dd, fdisk, shutdown, reboot, halt, poweroff, bcdedit, reg add|delete|import,
+     Set-ExecutionPolicy, setx, sudo/su/runas, chmod/chown -R on `/` or outside the workspace;
+  4. reading secret files (same isSecretPath rules; read tools already ask in every mode).
+  Edits: allowed (file tools are confined to the workspace anyway), except secret files.
+- Same auditing as Auto: one `[ultra] allow|ask …` log line per decision; `canRun` voids Ultra/Auto approvals once the mode
+  changes to something stricter. Switching to Ultra adds a system note: "Mode is now Ultra: edits and commands run without
+  asking except a few catastrophic actions. Prefer reversible steps and say what you're about to do."
+- UI: Ultra in the mode switcher (red), confirm bar with the backstop list, persistent red banner; status bar error colour.
+
 ## R3 file ownership
 Same owners as Round 2, plus: `src/team/autoPolicy.ts` → core; `src/agent/classifier.ts` → loop; `package.json` rename (whole
 file, incl. `name`/`displayName`) → panel; `src/agent/client.ts` key migration → panel.
