@@ -53,8 +53,12 @@ const SCRIPT_EXT = /\.(sh|bat|cmd|ps1)$/;
 
 /** Files an agent should not change without the user: always asks in Auto and is never covered by "approve all". */
 export function isSensitivePath(absPath: string, root: string): boolean {
-  void root;
-  const parts = absPath
+  // Judge only the part inside the workspace: the workspace's own location (e.g. a RUNNER~1 short-name temp
+  // folder, or a project kept under some .vscode folder) must not make every file in it look sensitive.
+  const nAbs = normalizePath(path.resolve(root, absPath));
+  const nRoot = normalizePath(root);
+  const inside = nAbs.startsWith(`${nRoot}/`) ? nAbs.slice(nRoot.length + 1) : nAbs === nRoot ? "" : absPath;
+  const parts = inside
     .replace(/\\/g, "/")
     .split("/")
     .filter(Boolean)

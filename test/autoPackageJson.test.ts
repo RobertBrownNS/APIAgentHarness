@@ -185,8 +185,12 @@ describe("build tools and runners (allow) versus watch/dev/publish (classify)", 
   it.each([
     "npx vite build", "vite build", "tsc", "esbuild src/index.ts --bundle --outfile=out.js", "npx rollup -c", "npx webpack", "npx tsup", "npx next build", "npx next lint", "npx astro build",
     "npx astro check", "npx svelte-kit sync", "npx jest", "jest --ci", "npx mocha", "ruff check .", "mypy src", "black --check .", "gradle test", "./gradlew build", "gradlew.bat check", "mvn test",
-    "mvn verify", "./mvnw package", "Select-String foo src\\a.ts", "sls foo src\\a.ts",
+    "mvn verify", "./mvnw package",
   ])("allow: %s", (c) => expect(v(c), c).toBe("allow"));
+  // PowerShell cmdlets with Windows paths: only meaningful where the default shell is cmd.
+  it.runIf(process.platform === "win32").each(["Select-String foo src\\a.ts", "sls foo src\\a.ts"])("allow on Windows: %s", (c) =>
+    expect(v(c), c).toBe("allow"),
+  );
   it.each(["npx vite build --watch", "npx tsc --watch", "tsc -w"])("long-running watch flags must not be allowed outright (GAP): %s", (c) => expect(v(c), c).not.toBe("allow"));
   it.each(["npx vite", "vite dev", "vite --host", "npx jest --watch", "npx next dev", "npx webpack serve", "npx astro dev", "mvn deploy", "mvn install", "mvn release:prepare", "black .", "npm run dev", "npm start", "npx serve"])(
     "not allowed outright: %s",

@@ -38,7 +38,9 @@ describe("existing files with risky whole-word names classify", () => {
   );
   it("also with ./ prefixes, Windows separators and python3/py", () => {
     expect(v("node ./deploy.js")).toBe("classify");
-    expect(v("node scripts\\release.mjs")).toBe("classify");
+    // Windows separators: classify under cmd; under sh the backslash is an escape, which asks (stricter).
+    if (process.platform === "win32") expect(v("node scripts\\release.mjs")).toBe("classify");
+    else expect(v("node scripts\\release.mjs")).toBe("ask");
     expect(v("python3 db-reset.py")).toBe("classify");
     expect(v("py db-reset.py")).toBe("classify");
     expect(v("PYTHON db-reset.py")).toBe("classify");

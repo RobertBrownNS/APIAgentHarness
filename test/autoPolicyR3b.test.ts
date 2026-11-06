@@ -43,7 +43,8 @@ describe("autoPolicy: code from a pipe, stdin, source, find -exec, backslashes",
   it.each(["r\\m -rf build", "g\\it push", "gi\\t status", "l\\s", "n\\ode x.js", "\\rm -rf x", "ec\\ho hi"])("backslash inside a command word asks: %s", (c) => {
     expect(v(c)).toBe("ask");
   });
-  it("backslashes in Windows paths and arguments are not command-word escapes", () => {
+  // Under sh (the default off Windows) a backslash is an escape, so these only hold on Windows.
+  it.runIf(process.platform === "win32")("backslashes in Windows paths and arguments are not command-word escapes", () => {
     expect(v("type src\\a.ts")).not.toBe("ask");
     expect(v("dir src\\sub")).not.toBe("ask");
     expect(v("git add src\\a.ts")).not.toBe("ask");

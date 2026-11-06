@@ -434,11 +434,14 @@ const MUST_CLASSIFY = [
   "cat .gitignore",
 ];
 
+/** Drive-letter paths (C:\x, D:\) are only absolute on Windows; elsewhere they're ordinary relative names. */
+const windowsOnly = (c: string) => process.platform !== "win32" && /\b[A-Za-z]:[\\/]/.test(c);
+
 describe("autoPolicy.checkCommand: hard rules", () => {
   for (const [group, cmds] of MUST_ASK) {
     describe(group, () => {
       for (const cmd of cmds) {
-        const t = GAP_ASK.has(cmd) ? it.fails : it;
+        const t = windowsOnly(cmd) ? it.skip : GAP_ASK.has(cmd) ? it.fails : it;
         t(`asks: ${cmd.slice(0, 100)}`, () => {
           for (const sh of shellsFor(cmd)) {
             const r = run(cmd, sh);
@@ -538,7 +541,7 @@ describe("autoPolicy.checkCommand: allowlist", () => {
     expect(verdict("ls | tee out.txt")).not.toBe("allow");
   });
   it("nothing in the hard-rule table is ever allowed", () => {
-    for (const [, cmds] of MUST_ASK) for (const c of cmds) expect(verdict(c), c).not.toBe("allow");
+    for (const [, cmds] of MUST_ASK) for (const c of cmds) if (!windowsOnly(c)) expect(verdict(c), c).not.toBe("allow");
   });
   it("an allowlisted word does not launder a dangerous argument or option", () => {
     for (const c of [
