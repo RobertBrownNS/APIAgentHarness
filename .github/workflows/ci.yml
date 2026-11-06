@@ -16,12 +16,9 @@ permissions:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    name: Test (Windows)
+    # NextAgent targets Windows (commands run through cmd.exe), so CI tests there only.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
