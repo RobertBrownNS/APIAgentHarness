@@ -359,13 +359,10 @@ const MUST_CLASSIFY = [
   "git add src/a.ts",
   "git commit -m 'fix bug'",
   'git commit -m "update push handler"',
-  "git stash",
   "git branch",
   "git branch -a",
   "git checkout main",
-  "git checkout -b feature",
   "git restore src/a.ts",
-  "git fetch",
   "git pull",
   "ls",
   "ls -la",
@@ -395,7 +392,6 @@ const MUST_CLASSIFY = [
   "dotnet test",
   "make",
   "make test",
-  "mkdir out",
   "mkdir -p out/a/b",
   "touch a.txt",
   "rm a.txt",
@@ -513,11 +509,7 @@ const CLASSIFY_ONLY = [
   "npm i -D vitest",
   "npm ci",
   "git checkout main",
-  "git checkout -b feature",
-  "git stash",
   "git pull",
-  "git fetch",
-  "mkdir out",
   "touch a.txt",
   "rm a.txt",
   "mv a.txt b.txt",
@@ -531,7 +523,6 @@ const CLASSIFY_ONLY = [
   "curl http://localhost:3000/health",
   "npx some-unlisted-tool",
   "git diff --output=out.patch",
-  "git branch newbranch",
 ];
 
 describe("autoPolicy.checkCommand: allowlist", () => {
@@ -543,7 +534,7 @@ describe("autoPolicy.checkCommand: allowlist", () => {
   });
   it("a command is allowed only if EVERY segment is allowlisted", () => {
     expect(verdict("git status && npm install")).toBe("classify");
-    expect(verdict("git status; mkdir x")).toBe("classify");
+    expect(verdict("git status; npm ci")).toBe("classify");
     expect(verdict("ls | tee out.txt")).not.toBe("allow");
   });
   it("nothing in the hard-rule table is ever allowed", () => {
@@ -815,9 +806,7 @@ describe("autoPolicy.checkEdit", () => {
     "home/.ssh/known_hosts",
     ".npmrc",
     "pkg/.npmrc",
-    "package.json",
     ".gitattributes",
-    "packages/a/package.json",
     ".github/workflows/ci.yml",
     ".vscode/settings.json",
     ".vscode/tasks.json",

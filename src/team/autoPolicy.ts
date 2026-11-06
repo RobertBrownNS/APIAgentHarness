@@ -2,15 +2,18 @@
 // Allowlist-first: a command is auto-allowed only if it is a recognised safe command with no expansion tricks.
 // Hard rules and anything suspicious -> "ask". Everything else -> "classify" (the model-based safety check).
 // The classifier can only turn "classify" into allow/ask; it never overrides "ask".
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 export interface PolicyContext {
   /** Absolute paths written or edited this session, normalised with normalizePath(). */
   written: ReadonlySet<string>;
   /** Body of a package.json script, if known. */
-  scriptBody?: (name: string) => string | undefined;
+  scriptBody?: (name: string, dir?: string) => string | undefined;
   /** True if the file was created or changed since the team started (by any means, e.g. a shell redirect or a build). */
   freshFile?: (absPath: string) => boolean;
+  /** True once package.json was edited this session (even harmlessly): installs then ask because they run lifecycle scripts. */
+  packageJsonChanged?: boolean;
 }
 
 export type CommandVerdict =
@@ -71,7 +74,6 @@ export function isSensitivePath(absPath: string, root: string): boolean {
     base === ".mcp.json" ||
     base === ".gitattributes" ||
     base === ".gitmodules" ||
-    base === "package.json" ||
     base === "makefile" ||
     base === "gnumakefile" ||
     SCRIPT_EXT.test(base)
@@ -82,6 +84,71 @@ const SECRET_DIRS = new Set([".ssh", ".aws", ".kube", ".docker", ".gnupg", ".azu
 const NON_SECRET_ENV = /^\.env\.(example|sample|template|dist)$/;
 
 /** Does this path (or path-like token) name a file that holds credentials? Reading it always asks. */
+/** bash-style brace expansion of one token, e.g. .{env,ssh/config} -> .env, .ssh/config. Returns undefined if too large. */
+function braceExpand(token: string, limit = 64): string[] | undefined {
+  const m = /^(.*?)\{([^{}]*)\}(.*)$/s.exec(token);
+  if (!m) return [token];
+  const [, pre, body, post] = m;
+  let alts: string[];
+  const range = /^(-?\d+)\.\.(-?\d+)$/.exec(body) ?? /^([A-Za-z])\.\.([A-Za-z])$/.exec(body);
+  if (range) {
+    const num = /\d/.test(range[1]);
+    const a = num ? Number(range[1]) : range[1].charCodeAt(0);
+    const b = num ? Number(range[2]) : range[2].charCodeAt(0);
+    if (Math.abs(b - a) > limit) return undefined;
+    alts = [];
+    for (let i = a; a <= b ? i <= b : i >= b; i += a <= b ? 1 : -1) alts.push(num ? String(i) : String.fromCharCode(i));
+  } else if (body.includes(",")) {
+    alts = body.split(",");
+  } else {
+    return [token];
+  }
+  const out: string[] = [];
+  for (const alt of alts) {
+    const sub = braceExpand(pre + alt + post, limit);
+    if (!sub) return undefined;
+    out.push(...sub);
+    if (out.length > limit) return undefined;
+  }
+  return out;
+}
+
+/** Expand a simple glob in the last path segment against the real folder and check for secret files. */
+function globTouchesSecret(token: string, cwd: string): boolean {
+  const norm = token.replace(/\\/g, "/");
+  const slash = norm.lastIndexOf("/");
+  const dirPart = slash >= 0 ? norm.slice(0, slash) : ".";
+  const pat = slash >= 0 ? norm.slice(slash + 1) : norm;
+  if (/[*?[]/.test(dirPart)) return true; // glob in a folder name: can't tell
+  let re: RegExp;
+  try {
+    let src = "";
+    for (let i = 0; i < pat.length; i++) {
+      const c = pat[i];
+      if (c === "*") src += ".*";
+      else if (c === "?") src += ".";
+      else if (c === "[") {
+        const end = pat.indexOf("]", i + 1);
+        if (end < 0) src += "\\[";
+        else {
+          src += `[${pat.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
+          i = end;
+        }
+      } else src += c.replace(/[.+^${}()|\\]/g, "\\$&");
+    }
+    re = new RegExp(`^${src}$`, "i");
+  } catch {
+    return true;
+  }
+  let names: string[];
+  try {
+    names = fs.readdirSync(path.resolve(cwd, dirPart));
+  } catch {
+    return false;
+  }
+  return names.some((n) => re.test(n) && isSecretFile(n));
+}
+
 function isSecretFile(token: string): boolean {
   const parts = token.replace(/\\/g, "/").split("/").filter(Boolean).map(cleanSegment);
   const base = parts[parts.length - 1] ?? "";
@@ -324,16 +391,21 @@ function expansionIn(cmd: string): string | undefined {
 function stripBenignRedirects(seg: string): string {
   return seg
     .replace(/&>\s*(\/dev\/null|nul)\b/gi, " ")
-    .replace(/\b[12]?>>?\s*(\/dev\/null|nul)\b/gi, " ")
+    .replace(/(^|\s)[12]?>>?\s*(\/dev\/null|nul)\b/gi, " ")
     .replace(/\b[12]>&[12]\b/g, " ");
 }
 
 // ---- allowlist ----
 
 const WRITERS = new Set([
-  "tee", "set-content", "add-content", "out-file", "cp", "copy", "mv", "move", "sed", "rm", "del", "erase", "ren", "rename",
+  "mkdir", "md", "tee", "set-content", "add-content", "out-file", "cp", "copy", "mv", "move", "sed", "rm", "del", "erase", "ren", "rename",
   "xcopy", "robocopy", "ni", "new-item", "sc", "ac", "install", "ln", "mklink",
 ]);
+const RUNNER_WORDS = new Set([
+  "tsc", "vitest", "eslint", "prettier", "pytest", "jest", "mocha", "esbuild", "tsup", "webpack", "rollup", "ruff", "mypy",
+  "vite", "next", "astro", "svelte-kit", "black", "gradle", "gradlew", "mvn", "mvnw",
+]);
+const READER_CMDLETS = new Set(["get-content", "gc", "select-string", "sls", "get-childitem", "gci", "select-object", "measure-object", "sort-object", "where-object", "test-path", "get-location", "get-command", "gcm", "where", "which"]);
 const READ_ONLY = new Set(["ls", "dir", "cat", "type", "head", "tail", "rg", "grep", "find", "wc", "pwd", "echo", "findstr"]);
 const GIT_SAFE = new Set(["status", "diff", "log", "show", "add", "commit", "rev-parse"]);
 
@@ -361,15 +433,151 @@ function namesWrittenFile(tokens: string[], root: string, written: ReadonlySet<s
   return false;
 }
 
+/** Scripts and files with names like these change or destroy things; they go to the classifier even if they exist already. */
+const DESTRUCTIVE_WORDS = new Set([
+  "deploy", "release", "publish", "clean", "reset", "migrate", "seed", "drop", "destroy", "rollback", "prod",
+  "production", "deployment", "migration", "migrations", "releases", "deploys", "rollbacks",
+]);
+const DESTRUCTIVE_NAME = {
+  /** Whole words only: split on non-alphanumerics and camelCase, so deploy.js and db:reset match but products.js and dropdown.tsx do not. */
+  test(name: string): boolean {
+    const words = name
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((w) => w.toLowerCase());
+    return words.some((w) => DESTRUCTIVE_WORDS.has(w));
+  },
+};
+
+const MODULE_SUFFIXES = ["", ".py", ".js", ".mjs", ".cjs", ".ts", ".json"];
+
+/**
+ * Option values given to a runner or script (`--config x`, `-p mod`, `--setupFiles=x`) can be code. Ask if one names
+ * a file written or created this session; module names (pytest -p mod) are tried with common extensions.
+ */
+function optionValueUntrusted(tokens: string[], start: number, cwd: string, ctx: PolicyContext): boolean {
+  if (ctx.written.size === 0 && !ctx.freshFile) return false;
+  const bad = (v: string | undefined): boolean => {
+    if (!v) return false;
+    for (const suf of MODULE_SUFFIXES) {
+      const abs = path.resolve(cwd, v + suf);
+      if (ctx.written.has(normalizePath(abs)) || ctx.freshFile?.(abs)) return true;
+    }
+    const asPath = path.resolve(cwd, v.replace(/\./g, "/") + ".py");
+    return ctx.written.has(normalizePath(asPath)) || !!ctx.freshFile?.(asPath);
+  };
+  for (let i = start; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.startsWith("-")) {
+      if (t.includes("=")) {
+        if (bad(t.slice(t.indexOf("=") + 1))) return true;
+      } else if (tokens[i + 1] && !tokens[i + 1].startsWith("-") && bad(tokens[i + 1])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+const CODE_OPTIONS = new Set(["--config", "-c", "--require", "-r", "--import", "--loader", "--setup", "--setupfiles", "--preset", "--plugin", "--rulesdir", "--resolve-plugins-relative-to", "--parser", "--globalsetup", "--reporter", "--environment", "--root", "--project", "-p", "--rootdir"]);
+
+function runnerOptionNamesWritten(tokens: string[], cwd: string, written: ReadonlySet<string>): boolean {
+  if (written.size === 0) return false;
+  const hit = (v: string | undefined) => !!v && written.has(normalizePath(path.resolve(cwd, v)));
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (!t.startsWith("-")) continue;
+    if (t.includes("=")) {
+      if (hit(t.slice(t.indexOf("=") + 1))) return true;
+    } else if (CODE_OPTIONS.has(t.toLowerCase()) && hit(tokens[i + 1])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const WATCH_FLAGS = new Set(["--watch", "-w", "--watchall", "--serve", "--dev", "--hot", "watch", "serve", "dev", "start", "--open"]);
+
+/**
+ * Build, test and lint tools that are safe to run without asking (they run the project's own code, like `npm test`).
+ * Returns the rule name, or undefined if this is not one of them (or it looks like a dev server / watcher / deploy).
+ */
+function buildToolRule(word: string, a: string[]): string | undefined {
+  const first = a.find((x) => !x.startsWith("-")) ?? "";
+  const watching = a.some((x) => WATCH_FLAGS.has(x.toLowerCase()) && x.toLowerCase() !== "--watch=false") || a.some((x) => /^--watch=(?!false$)/i.test(x));
+  // A watcher or dev server never exits and would just burn the command timeout.
+  if (watching) return undefined;
+  switch (word) {
+    case "tsc":
+    case "eslint":
+      return word;
+    case "vitest":
+      // Bare `vitest` starts a watcher in a terminal: require an explicit single run.
+      return first === "run" || a.includes("--run") || a.some((x) => x.toLowerCase() === "--watch=false") ? word : undefined;
+    case "jest":
+    case "mocha":
+    case "esbuild":
+    case "tsup":
+    case "webpack":
+    case "rollup":
+    case "ruff":
+    case "mypy":
+      return watching ? undefined : word;
+    case "vite":
+      return first === "build" ? "vite build" : undefined;
+    case "next":
+      return first === "build" || first === "lint" ? `next ${first}` : undefined;
+    case "astro":
+      return first === "build" || first === "check" ? `astro ${first}` : undefined;
+    case "svelte-kit":
+      return first === "sync" || first === "build" ? `svelte-kit ${first}` : undefined;
+    case "black":
+      return a.includes("--check") ? "black --check" : undefined;
+    case "prettier":
+      return a.includes("--check") ? "prettier --check" : undefined;
+    case "gradle":
+    case "gradlew":
+    case "mvn":
+    case "mvnw": {
+      if (a.some((x) => ["publish", "deploy", "install", "release", "upload"].includes(x.toLowerCase()))) return undefined;
+      return ["test", "build", "check", "verify", "compile", "package", "assemble", "classes"].includes(first.toLowerCase()) ? `${word} ${first}` : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
 type SegVerdict = { v: "allow"; rule: string } | { v: "classify"; scriptBody?: string } | { v: "ask"; rule: string };
 
-function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: number): SegVerdict {
+function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: number, cwd: string = root): SegVerdict {
   const cleaned = stripBenignRedirects(seg).trim();
-  const tokens = tokenize(cleaned);
-  if (tokens.length === 0) return { v: "allow", rule: "empty" };
+  const rawTokens = tokenize(cleaned);
+  if (rawTokens.length === 0) return { v: "allow", rule: "empty" };
   const rawFirst = cleaned.split(/\s+/)[0] ?? "";
   if (/['"]/.test(rawFirst)) return { v: "ask", rule: "quoted command name" };
   if (rawFirst.includes("\\") && !/^([A-Za-z]:|\.\\|\\\\)/.test(rawFirst)) return { v: "ask", rule: "backslash inside the command name" };
+  if (rawFirst.includes("{")) return { v: "ask", rule: "brace expansion in the command name" };
+
+  // bash expands {a,b} and {1..3} before the command runs: every later check sees the expanded words.
+  const tokens: string[] = [];
+  for (let i = 0; i < rawTokens.length; i++) {
+    const tk = rawTokens[i];
+    if (!/\{[^{}]*(,|\.\.)[^{}]*\}/.test(tk)) {
+      tokens.push(tk);
+      continue;
+    }
+    const alts = braceExpand(tk);
+    if (!alts) return { v: "ask", rule: "large brace expansion" };
+    // `--config {a,b}.js`: judge every alternative as that option's value, not only the first.
+    const prev = rawTokens[i - 1];
+    if (prev && prev.startsWith("-") && !prev.includes("=") && alts.length > 1) {
+      tokens.pop();
+      for (const alt of alts) tokens.push(prev, alt);
+    } else {
+      tokens.push(...alts);
+    }
+  }
 
   // Skip VAR=value prefixes for the command word.
   let ci = 0;
@@ -412,10 +620,15 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
   }
   if (word === "cd" && args.some((a) => a === ".." || a.startsWith("..") )) return { v: "ask", rule: "cd leaves the workspace" };
 
+  // A glob that matches a secrets file in the folder is a secrets read (cat .e*, type id_*, grep x cred*).
+  if (t.slice(1).some((a) => /[*?[]/.test(a) && globTouchesSecret(a, cwd))) return { v: "ask", rule: "glob matches a secrets file" };
+  if (word === "rg" && lowerArgs.some((a) => a === "--hidden" || a === "--no-ignore" || a.startsWith("--no-ignore-") || /^-u+$/.test(a) || a === "--unrestricted")) {
+    return { v: "ask", rule: "rg searches hidden or ignored files" };
+  }
   // Reading credentials into the conversation is not something to do silently.
   if (t.slice(1).some((a) => isSecretFile(a))) return { v: "ask", rule: "touches a secrets file" };
 
-  if (WRITERS.has(word) && t.slice(1).some((a) => !a.startsWith("-") && isSensitivePath(path.resolve(root, a), root))) {
+  if (WRITERS.has(word) && t.slice(1).some((a) => !a.startsWith("-") && isSensitivePath(path.resolve(cwd, a), root))) {
     return { v: "ask", rule: "writes a sensitive path" };
   }
 
@@ -424,13 +637,20 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
     const runners = new Set(["node", "deno", "bun", "python", "python3", "py", "ruby", "perl", "php", "lua", "sh", "bash", "zsh", "dash", "ksh", "fish", "cmd", "pwsh", "powershell"]);
     const candidates = runners.has(word) ? t.slice(1).filter((a) => !a.startsWith("-")) : [];
     if (/\.(bat|cmd|ps1|sh|exe)$/i.test(t[0] ?? "") || /^\.[\\/]/.test(t[0] ?? "")) candidates.push(t[0]);
-    if (candidates.some((a) => ctx.freshFile!(path.resolve(root, a)))) return { v: "ask", rule: "runs a file created this session" };
+    if (candidates.some((a) => ctx.freshFile!(path.resolve(cwd, a)))) return { v: "ask", rule: "runs a file created this session" };
   }
 
   const hasRedirect = /[<>]/.test(cleaned);
-  const readOnlyish = READ_ONLY.has(word) || word === "git";
+  // Test runners and linters are exempt like npm test: running the project's own tests is the accepted trust level.
+  const runner =
+    RUNNER_WORDS.has(word) || (word === "npx" && RUNNER_WORDS.has(lowerArgs[0] ?? ""));
+  const readOnlyish = READ_ONLY.has(word) || word === "git" || runner || READER_CMDLETS.has(word);
   // A command that names a file written this session may be running it. Read-only utilities and git can't execute it.
-  if (!readOnlyish && namesWrittenFile(t, root, ctx.written)) return { v: "ask", rule: "runs or reads a file written this session" };
+  // A runner may run a written test file, but a written config / plugin / loader passed as an option runs as code.
+  if (runner && (runnerOptionNamesWritten(t, cwd, ctx.written) || optionValueUntrusted(t, 1, cwd, ctx))) {
+    return { v: "ask", rule: "a file written this session is passed as an option" };
+  }
+  if (!readOnlyish && namesWrittenFile(t, cwd, ctx.written)) return { v: "ask", rule: "runs or reads a file written this session" };
 
   if (hasRedirect) return { v: "classify" };
 
@@ -455,7 +675,30 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
     }
     if (sub === "branch" && gargs.includes("-D")) return { v: "ask", rule: "git branch -D" };
     if (sub === "commit" && lg.includes("--amend")) return { v: "ask", rule: "git commit --amend" };
+    if (sub === "stash") {
+      const action = gargs[0] && !gargs[0].startsWith("-") ? lg[0] : "push";
+      return ["push", "list", "show", "pop", "apply", "save"].includes(action) ? { v: "allow", rule: `git stash ${action}` } : { v: "classify" };
+    }
+    if (sub === "checkout" && gargs[0] === "-b" && gargs.length >= 2 && gargs.length <= 3 && gargs.slice(1).every((a) => !a.startsWith("-"))) {
+      return { v: "allow", rule: "git checkout -b" };
+    }
+    if (sub === "switch") {
+      // Only plain `switch <branch>` and `switch -c <new> [<start>]`; anything that can discard work goes to the classifier.
+      const names = gargs.filter((a) => !a.startsWith("-"));
+      const flagsOk = lg.every((a) => !a.startsWith("-") || a === "-c" || a === "--create");
+      if (flagsOk && names.length >= 1 && names.length <= 2) return { v: "allow", rule: "git switch" };
+      return { v: "classify" };
+    }
+    if (sub === "fetch") {
+      const plain = gargs.every((a) => ["--all", "--prune", "-p", "--tags", "-t", "-a"].includes(a.toLowerCase()) || /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(a));
+      return plain && !gargs.some((a) => /^[a-z]+:\/\//i.test(a)) ? { v: "allow", rule: "git fetch" } : { v: "classify" };
+    }
+    if (sub === "restore" && lg.some((a) => a === "--staged" || a === "-S") && !lg.some((a) => ["--worktree", "-w", "--source", "-s"].includes(a) || a.startsWith("--source="))) {
+      return { v: "allow", rule: "git restore --staged" };
+    }
     if (sub === "branch") {
+      const names = gargs.filter((a) => !a.startsWith("-"));
+      if (names.length >= 1 && names.length <= 2 && gargs.every((a) => !a.startsWith("-"))) return { v: "allow", rule: "git branch (create)" };
       const listOnly = gargs.every((a) => ["-a", "-r", "-v", "-vv", "--list", "--all", "--remotes", "--show-current", "--verbose"].includes(a));
       return listOnly ? { v: "allow", rule: "git branch (list)" } : { v: "classify" };
     }
@@ -477,6 +720,36 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
     if (word === "findstr" && lowerArgs.includes("/s")) return { v: "classify" };
     return { v: "allow", rule: word };
   }
+  if (word === "popd") return { v: "ask", rule: "popd goes back to an unknown folder" };
+  if (["cd", "chdir", "pushd", "set-location", "sl"].includes(word)) {
+    const target = args.filter((a) => !a.startsWith("/") || a.length > 2).filter((a) => !a.startsWith("-") && a.toLowerCase() !== "/d").pop();
+    if (!target) return { v: "classify" };
+    const abs = path.resolve(cwd, target);
+    return isInside(abs, root) ? { v: "allow", rule: "cd inside the workspace" } : { v: "ask", rule: "cd leaves the workspace" };
+  }
+  if (word === "mkdir" || word === "md") return { v: "allow", rule: "mkdir inside the workspace" };
+  if (word === "new-item" || word === "ni") {
+    const ti = lowerArgs.findIndex((a) => a === "-itemtype" || a === "-type");
+    return ti >= 0 && lowerArgs[ti + 1] === "directory" ? { v: "allow", rule: "New-Item -ItemType Directory" } : { v: "classify" };
+  }
+  if (["where", "which", "get-command", "gcm", "get-location", "test-path", "select-object", "measure-object", "sort-object", "where-object", "get-content", "gc", "select-string", "sls"].includes(word)) {
+    return { v: "allow", rule: word };
+  }
+  if (word === "get-childitem" || word === "gci") {
+    return lowerArgs.some((a) => a === "-recurse" || a === "-r" || a === "-rec") ? { v: "classify" } : { v: "allow", rule: "Get-ChildItem" };
+  }
+  if (["node", "python", "python3", "py"].includes(word) && args[0] && !args[0].startsWith("-") && /\.(c?m?js|py|ts)$/i.test(args[0]) && ctx.freshFile) {
+    const abs = path.resolve(cwd, args[0]);
+    if (args.some((a) => !a.startsWith("-") && DESTRUCTIVE_NAME.test(a))) return { v: "classify" }; // any folder or file name in the path
+    if (isInside(abs, root) && !isSensitivePath(abs, root) && !ctx.written.has(normalizePath(abs)) && !ctx.freshFile(abs)) {
+      try {
+        if (fs.statSync(abs).isFile()) return { v: "allow", rule: `${word} <existing file>` };
+      } catch {
+        /* missing: let the classifier decide */
+      }
+    }
+    return { v: "classify" };
+  }
   if ((word === "node" || word === "python" || word === "python3") && lowerArgs.length === 1 && ["--version", "-v"].includes(lowerArgs[0])) {
     return { v: "allow", rule: `${word} --version` };
   }
@@ -486,38 +759,69 @@ function judgeSegment(seg: string, root: string, ctx: PolicyContext, depth: numb
   if (word === "go" && ["build", "test", "vet"].includes(lowerArgs[0] ?? "")) return { v: "allow", rule: `go ${lowerArgs[0]}` };
   if (word === "dotnet" && ["build", "test"].includes(lowerArgs[0] ?? "")) return { v: "allow", rule: `dotnet ${lowerArgs[0]}` };
   // Bare binaries as they appear in package.json scripts (node_modules/.bin is on the PATH there).
-  if (word === "tsc" || word === "vitest" || word === "eslint") return { v: "allow", rule: word };
-  if (word === "prettier" && lowerArgs.includes("--check")) return { v: "allow", rule: "prettier --check" };
-  if (word === "npx") {
-    const tool = lowerArgs[0] ?? "";
-    if (tool === "tsc" || tool === "vitest" || tool === "eslint") return { v: "allow", rule: `npx ${tool}` };
-    if (tool === "prettier" && lowerArgs.includes("--check")) return { v: "allow", rule: "npx prettier --check" };
-    return { v: "classify" };
+  {
+    const rule = buildToolRule(word, lowerArgs);
+    if (rule) return { v: "allow", rule };
   }
-  if (word === "npm" || word === "pnpm" || word === "yarn") return judgeScript(word, lowerArgs, args, root, ctx, depth);
+  if (word === "npx") {
+    const rule = buildToolRule(lowerArgs[0] ?? "", lowerArgs.slice(1));
+    return rule ? { v: "allow", rule: `npx ${rule}` } : { v: "classify" };
+  }
+  if (word === "npm" || word === "pnpm" || word === "yarn") {
+    // --prefix / --dir / -C / --cwd <dir>: the package in that folder
+    let dir: string | undefined;
+    const rest: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (["--prefix", "--dir", "-C", "--cwd"].includes(a)) {
+        dir = args[i + 1];
+        i++;
+      } else if (/^--(prefix|dir|cwd)=/.test(a)) {
+        dir = a.slice(a.indexOf("=") + 1);
+      } else {
+        rest.push(a);
+      }
+    }
+    let pkgCwd = cwd;
+    if (dir !== undefined) {
+      pkgCwd = path.resolve(cwd, dir);
+      if (!dir || !isInside(pkgCwd, root)) return { v: "ask", rule: "package folder is outside the workspace" };
+    }
+    const lr = rest.map((a) => a.toLowerCase());
+    if (ctx.packageJsonChanged && ["install", "i", "ci", "add", "update", "up", "upgrade", "rebuild", "isntall"].includes(lr[0] ?? "")) {
+      return { v: "ask", rule: "package.json was edited this session; installing runs lifecycle scripts" };
+    }
+    const readOnly = word === "npm" ? ["ls", "list", "outdated", "view", "explain", "why", "root"] : word === "pnpm" ? ["ls", "list", "outdated", "why"] : ["list", "outdated", "why", "info"];
+    if (lr.length > 0 && readOnly.includes(lr[0]) && !lr.includes("-g") && !lr.includes("--global")) {
+      return { v: "allow", rule: `${word} ${lr[0]}` };
+    }
+    return judgeScript(word, lr, rest, root, ctx, depth, pkgCwd);
+  }
   return { v: "classify" };
 }
 
 /** npm|pnpm|yarn test / run <script>: check the script body itself, recursively. */
-function judgeScript(pm: string, lowerArgs: string[], args: string[], root: string, ctx: PolicyContext, depth: number): SegVerdict {
+function judgeScript(pm: string, lowerArgs: string[], args: string[], root: string, ctx: PolicyContext, depth: number, cwd: string = root): SegVerdict {
   let name: string | undefined;
   if (lowerArgs[0] === "test" || lowerArgs[0] === "t") name = "test";
   else if (lowerArgs[0] === "run" || lowerArgs[0] === "run-script") name = args[1];
   else return { v: "classify" };
   if (!name || name.startsWith("-")) return { v: "classify" };
-  if (ctx.written.has(normalizePath(path.resolve(root, "package.json")))) {
+  if (ctx.written.has(normalizePath(path.resolve(cwd, "package.json")))) {
     return { v: "ask", rule: "package.json was changed this session" };
   }
-  const body = ctx.scriptBody?.(name);
+  if (optionValueUntrusted(args, 2, cwd, ctx)) return { v: "ask", rule: "a file created this session is passed to the script as an option" };
+  const body = ctx.scriptBody?.(name, cwd);
   if (body === undefined || depth >= MAX_SCRIPT_DEPTH) return { v: "classify" };
-  const inner = judge(body, root, ctx, depth + 1);
+  const inner = judge(body, root, ctx, depth + 1, cwd);
   if (inner.verdict === "ask") return { v: "ask", rule: `script "${name}": ${inner.rule}` };
-  const listed = name === "test" || name === "lint" || name === "build";
-  if (inner.verdict === "allow" && listed) return { v: "allow", rule: `${pm} ${name} (script is safe)` };
+  if (DESTRUCTIVE_NAME.test(name)) return { v: "classify", scriptBody: body };
+  if (inner.verdict === "allow") return { v: "allow", rule: `${pm} ${name} (script is safe)` };
   return { v: "classify", scriptBody: body };
 }
 
-function judge(command: string, root: string, ctx: PolicyContext, depth: number): CommandVerdict {
+function judge(command: string, root: string, ctx: PolicyContext, depth: number, cwd0: string = root): CommandVerdict {
+  let cwd = cwd0;
   if (typeof command !== "string") return { verdict: "ask", rule: "command is not text" };
   // Fold lookalike characters and drop invisible ones so they can't hide a keyword.
   command = command.normalize("NFKC").replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g, "");
@@ -528,6 +832,29 @@ function judge(command: string, root: string, ctx: PolicyContext, depth: number)
   const exp = expansionIn(command);
   if (exp) return { verdict: "ask", rule: exp };
   if (unbalancedQuotes(command)) return { verdict: "ask", rule: "unbalanced quotes" };
+  if ((command.match(/\{/g) ?? []).length !== (command.match(/\}/g) ?? []).length) return { verdict: "ask", rule: "unbalanced braces" };
+  // bash expands {a,b} / {1..3} before running: a command name built from braces asks, and everything else is judged expanded.
+  if (/\{[^{}]*(,|\.\.)[^{}]*\}/.test(command)) {
+    if (splitSegments(command).some((s) => (s.trim().split(/\s+/)[0] ?? "").includes("{"))) {
+      return { verdict: "ask", rule: "brace expansion in the command name" };
+    }
+    let tooBig = false;
+    command = command.replace(/\S+/g, (w, offset: number, whole: string) => {
+      if (!/\{[^{}]*(,|\.\.)[^{}]*\}/.test(w)) return w;
+      const alts = braceExpand(w);
+      if (!alts) {
+        tooBig = true;
+        return w;
+      }
+      // `--config {a,b}.js`: judge every alternative as that option's value, not only the first.
+      const prev = whole.slice(0, offset).trimEnd().split(/\s+/).pop() ?? "";
+      if (prev.startsWith("-") && !prev.includes("=") && alts.length > 1) {
+        return [alts[0], ...alts.slice(1).map((a) => `${prev} ${a}`)].join(" ");
+      }
+      return alts.join(" ");
+    });
+    if (tooBig) return { verdict: "ask", rule: "large brace expansion" };
+  }
   const hard = hardRule(command, root);
   if (hard) return { verdict: "ask", rule: hard };
 
@@ -535,7 +862,12 @@ function judge(command: string, root: string, ctx: PolicyContext, depth: number)
   let classify = false;
   let scriptBody: string | undefined;
   for (const seg of splitSegments(command)) {
-    const r = judgeSegment(seg, root, ctx, depth);
+    const r = judgeSegment(seg, root, ctx, depth, cwd);
+    // "cd <dir> && rest": the following segments run in that folder.
+    if (r.v === "allow" && r.rule === "cd inside the workspace") {
+      const target = tokenize(seg).slice(1).filter((a) => a.toLowerCase() !== "/d").pop();
+      if (target) cwd = path.resolve(cwd, target);
+    }
     if (r.v === "ask") return { verdict: "ask", rule: r.rule };
     if (r.v === "classify") {
       classify = true;
@@ -583,4 +915,53 @@ export function writeTargets(command: string, root: string): string[] {
     }
   }
   return [...out];
+}
+
+const PKG_HARMLESS_KEYS = new Set([
+  "name", "version", "description", "keywords", "author", "contributors", "license", "repository", "bugs", "homepage", "private",
+  "files", "engines", "os", "cpu", "funding", "displayname", "publisher", "icon", "categories", "gallerybanner", "preview", "sideeffects",
+]);
+const PKG_DEP_SECTIONS = new Set(["dependencies", "devdependencies", "peerdependencies", "optionaldependencies"]);
+/** A dependency specifier that only names a registry version or tag (no URL, path, git or alias). */
+const PLAIN_SPEC = /^[A-Za-z0-9^~<>=*.\-+| ]+$/;
+
+/**
+ * A package.json change is only risky if it touches fields that run code or install hooks:
+ * scripts, bin, husky / lint-staged / simple-git-hooks, any pre* / post* / prepare hook, or config.
+ * Returns what was touched, or undefined for a harmless change (dependencies, version, description ...).
+ */
+export function packageJsonRisk(oldContent: string | undefined, newContent: string): string | undefined {
+  let next: Record<string, unknown>;
+  try {
+    next = JSON.parse(newContent) as Record<string, unknown>;
+  } catch {
+    return "the result is not valid JSON";
+  }
+  let prev: Record<string, unknown> = {};
+  if (oldContent !== undefined) {
+    try {
+      prev = JSON.parse(oldContent) as Record<string, unknown>;
+    } catch {
+      return "the current file is not valid JSON";
+    }
+  }
+  if (typeof next !== "object" || next === null || typeof prev !== "object" || prev === null) return "unexpected structure";
+  const keys = new Set<string>([...Object.keys(next), ...Object.keys(prev)]);
+  for (const k of keys) {
+    if (JSON.stringify(prev[k]) === JSON.stringify(next[k])) continue;
+    const lk = k.toLowerCase();
+    if (PKG_HARMLESS_KEYS.has(lk)) continue;
+    if (PKG_DEP_SECTIONS.has(lk)) {
+      const a = (prev[k] ?? {}) as Record<string, unknown>;
+      const b = (next[k] ?? {}) as Record<string, unknown>;
+      for (const dep of Object.keys(b)) {
+        if (JSON.stringify(a[dep]) !== JSON.stringify(b[dep]) && !(typeof b[dep] === "string" && PLAIN_SPEC.test(b[dep] as string))) {
+          return `adds dependency "${dep}" with a non-registry source`;
+        }
+      }
+      continue;
+    }
+    return `changes "${k}"`;
+  }
+  return undefined;
 }

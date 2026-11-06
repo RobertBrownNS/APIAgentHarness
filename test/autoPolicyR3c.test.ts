@@ -48,7 +48,7 @@ describe("extended sensitive edit paths", () => {
   it.each([
     ".claude/settings.json", ".claude/commands/x.md", ".cursor/rules", ".devcontainer/devcontainer.json", ".mcp.json", ".gitattributes",
     ".gitmodules", ".yarnrc", ".yarnrc.yml", ".pypirc", ".husky/pre-commit", ".github/workflows/ci.yml", "node_modules/.bin/tsc", "Makefile",
-    "build.sh", "run.bat", "x.cmd", "setup.ps1", "package.json", "sub/package.json", ".npmrc", ".git/config", ".vscode/tasks.json", ".ssh/config",
+    "build.sh", "run.bat", "x.cmd", "setup.ps1", ".npmrc", ".git/config", ".vscode/tasks.json", ".ssh/config",
     ".env.local", "a.pem", "id_rsa",
     // variants
     ".CLAUDE/settings.json", ".Mcp.Json", "BUILD.SH", "RUN.BAT", "makefile", ".claude./x", ".claude /x",
@@ -56,7 +56,7 @@ describe("extended sensitive edit paths", () => {
     expect(checkEdit(p(rel), ROOT).verdict, rel).toBe("ask");
     expect(isSensitivePath(p(rel), ROOT), rel).toBe(true);
   });
-  it.each(["src/a.ts", "README.md", "tsconfig.json", ".gitignore", ".eslintrc.json", ".prettierrc", "docs/guide.md", "src/claude.ts", "src/cursor.ts", "src/make.ts", "scripts.md"])("allows: %s", (rel) => {
+  it.each(["src/a.ts", "README.md", "tsconfig.json", ".gitignore", ".eslintrc.json", ".prettierrc", "docs/guide.md", "package.json", "sub/package.json", "src/claude.ts", "src/cursor.ts", "src/make.ts", "scripts.md"])("allows: %s", (rel) => {
     expect(checkEdit(p(rel), ROOT).verdict, rel).toBe("allow");
   });
 });

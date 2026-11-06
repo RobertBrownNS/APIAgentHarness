@@ -65,7 +65,8 @@ ${check.scriptBody.slice(0, MAX_COMMAND)}
       const msg = await client.beta.messages.create(
         {
           model: getModel() || DEFAULT_SAFETY_MODEL,
-          max_tokens: 200,
+          max_tokens: 1024,
+          thinking: { type: "disabled" }, // otherwise adaptive thinking can eat the whole budget and leave no verdict
           system: SYSTEM,
           messages: [{ role: "user", content: user }],
           output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
@@ -83,6 +84,7 @@ ${check.scriptBody.slice(0, MAX_COMMAND)}
         cacheWrite,
       };
       if (msg.stop_reason === "refusal") return { ...ask("the check model declined"), usage };
+      if (msg.stop_reason === "max_tokens") return { ...ask("the check ran out of tokens before answering"), usage };
       const text = msg.content
         .filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
         .map((b) => b.text)

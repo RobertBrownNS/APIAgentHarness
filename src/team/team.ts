@@ -19,7 +19,7 @@ import { withFileLock } from "./fileLock";
 import { MailboxImpl } from "./mailbox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { checkCommand, checkEdit, globNamesSecrets, isSecretPath, isSensitivePath, normalizePath, writeTargets } from "./autoPolicy";
+import { checkCommand, checkEdit, globNamesSecrets, isSecretPath, isSensitivePath, normalizePath, packageJsonRisk, writeTargets } from "./autoPolicy";
 import { TaskStoreImpl } from "./taskStore";
 import type { AgentHandle, AgentOptions, Authorization, CommandClassifier, MailMessage, TeamContext } from "./types";
 
@@ -113,6 +113,10 @@ export class Team implements TeamContext {
   private plans = new Map<string, { mode?: "normal" | "auto"; feedback?: string }>();
   private written = new Set<string>();
   private startedAt = Date.now();
+  /** package.json was edited this session (any edit). */
+  private pkgChanged = false;
+  /** package.json edits seen by authorize: normalised path -> what makes it risky (undefined = harmless). */
+  private pkgRisk = new Map<string, string | undefined>();
   /** Tool calls approved by Auto mode that have not run yet (id -> true). canRun refuses them once Auto is off. */
   private autoApprovedIds = new Set<string>();
 
@@ -411,6 +415,7 @@ export class Team implements TeamContext {
     const mode = this.currentMode;
     const mutating = MUTATING_TOOLS.has(req.tool);
     const isEdit = req.tool === "edit_file" || req.tool === "write_file";
+    if (isEdit) this.notePackageJson(req);
     // Credential files are never read silently, in any mode.
     if (!mutating && this.readsSecret(req)) return this.ask(req, signal, "reads a secrets file");
     if (mode === "plan" && mutating) {
@@ -425,15 +430,19 @@ export class Team implements TeamContext {
       if (isEdit) {
         const target = this.editTarget(req);
         const v = target ? checkEdit(target, this.root) : ({ verdict: "ask", rule: "path unknown" } as const);
-        if (v.verdict === "allow") return this.autoOk(req, "edit inside the workspace");
-        return this.ask(req, signal, v.rule);
+        if (v.verdict === "allow") {
+          const risk = target ? this.pkgRisk.get(normalizePath(target)) : undefined;
+          if (risk) return this.autoAsk(req, signal, `package.json ${risk}`, "rule");
+          return this.autoOk(req, "edit inside the workspace", "rule");
+        }
+        return this.autoAsk(req, signal, v.rule, "rule");
       }
       const command = this.commandOf(req.input);
-      const hard = checkCommand(command, this.root, { written: this.written, scriptBody: (n) => this.scriptBody(n), freshFile: (p) => this.isFresh(p) });
-      if (hard.verdict === "ask") return this.ask(req, signal, hard.rule);
-      if (hard.verdict === "allow") return this.autoOk(req, hard.rule);
+      const hard = checkCommand(command, this.root, { written: this.written, scriptBody: (n, dir) => this.scriptBody(n, dir), freshFile: (p) => this.isFresh(p), packageJsonChanged: this.pkgChanged });
+      if (hard.verdict === "ask") return this.autoAsk(req, signal, hard.rule, "rule");
+      if (hard.verdict === "allow") return this.autoOk(req, hard.rule, "rule");
       const classify = this.opts.settings().autoSafetyCheck === false ? undefined : this.opts.classify;
-      if (!classify) return this.ask(req, signal, "no safety check is available for commands");
+      if (!classify) return this.autoAsk(req, signal, "no safety check is available for commands", "rule");
       let verdict: Awaited<ReturnType<CommandClassifier>>;
       try {
         verdict = await classify(
@@ -448,8 +457,8 @@ export class Team implements TeamContext {
       if (signal.aborted) return { approved: false, reason: "stopped by user" };
       // The user may have switched modes while the check ran; decide again under the new mode.
       if (this.currentMode !== "auto") return this.authorize(req, signal);
-      if (verdict.verdict === "allow") return this.autoOk(req, verdict.reason);
-      return this.ask(req, signal, verdict.reason);
+      if (verdict.verdict === "allow") return this.autoOk(req, verdict.reason, "check");
+      return this.autoAsk(req, signal, verdict.reason, "check");
     }
     return this.ask(req, signal, undefined);
   }
@@ -461,15 +470,37 @@ export class Team implements TeamContext {
     return typeof input.glob === "string" && globNamesSecrets(input.glob);
   }
 
+  /** For an edit to a package.json, work out whether the change touches scripts, hooks, bin or config. */
+  private notePackageJson(req: { tool: string; input: unknown; absPath?: string }): void {
+    const target = this.editTarget(req);
+    if (!target || path.basename(target).toLowerCase() !== "package.json") return;
+    const key = normalizePath(target);
+    const input = (req.input ?? {}) as { old_str?: unknown; new_str?: unknown; contents?: unknown };
+    let before: string | undefined;
+    try {
+      before = fs.readFileSync(target, "utf8");
+    } catch {
+      before = undefined;
+    }
+    let after: string | undefined;
+    if (req.tool === "write_file" && typeof input.contents === "string") {
+      after = input.contents;
+    } else if (req.tool === "edit_file" && before !== undefined && typeof input.old_str === "string" && typeof input.new_str === "string") {
+      const first = before.indexOf(input.old_str);
+      after = first >= 0 && before.indexOf(input.old_str, first + 1) < 0 ? before.slice(0, first) + input.new_str + before.slice(first + input.old_str.length) : undefined;
+    }
+    this.pkgRisk.set(key, after === undefined ? "edit could not be analysed" : packageJsonRisk(before, after));
+  }
+
   private editTarget(req: { input: unknown; absPath?: string }): string | undefined {
     if (req.absPath) return req.absPath;
     const p = this.pathOf(req.input);
     return p ? path.resolve(this.root, p) : undefined;
   }
 
-  private scriptBody(name: string): string | undefined {
+  private scriptBody(name: string, dir?: string): string | undefined {
     try {
-      const pkg = JSON.parse(fs.readFileSync(path.join(this.root, "package.json"), "utf8")) as { scripts?: Record<string, unknown> };
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir ?? this.root, "package.json"), "utf8")) as { scripts?: Record<string, unknown> };
       const body = pkg.scripts?.[name];
       return typeof body === "string" ? body : undefined;
     } catch {
@@ -488,7 +519,14 @@ export class Team implements TeamContext {
 
   /** Called after a successful edit/write so the written-file rule can apply to later commands. */
   recordWrite(_agent: string, absPath: string): void {
-    this.written.add(normalizePath(absPath));
+    const key = normalizePath(absPath);
+    if (path.basename(absPath).toLowerCase() === "package.json") this.pkgChanged = true;
+    if (this.pkgRisk.has(key)) {
+      const risk = this.pkgRisk.get(key);
+      this.pkgRisk.delete(key);
+      if (risk === undefined) return; // a harmless package.json edit (dependencies, version ...) does not taint npm scripts
+    }
+    this.written.add(key);
   }
 
   /**
@@ -516,11 +554,33 @@ export class Team implements TeamContext {
     return typeof c === "string" ? c : "";
   }
 
-  private autoOk(req: { id?: string; agent: string; tool: string; input: unknown }, why: string): Authorization {
+  /** One log line per Auto decision, always from here: `[auto] allow (rule: x) agent: cmd`. */
+  private logAuto(
+    outcome: "allow" | "ask",
+    source: "rule" | "check",
+    req: { agent: string; tool: string; input: unknown },
+    why: string,
+  ): void {
+    const clip = (x: string) => x.replace(/\s+/g, " ").trim().slice(0, 200);
+    const isCmd = req.tool === "run_command";
+    const subject = isCmd ? clip(this.commandOf(req.input)) : `edit ${clip(this.pathOf(req.input) ?? req.tool)}`;
+    this.opts.log?.(`[auto] ${outcome} (${source}: ${clip(why)}) ${req.agent}: ${subject}`);
+  }
+
+  private autoAsk(
+    req: { id: string; agent: string; tool: string; input: unknown; absPath?: string },
+    signal: AbortSignal,
+    reason: string,
+    source: "rule" | "check",
+  ): Promise<Authorization> {
+    this.logAuto("ask", source, req, reason);
+    return this.ask(req, signal, reason);
+  }
+
+  private autoOk(req: { id?: string; agent: string; tool: string; input: unknown }, why: string, source: "rule" | "check"): Authorization {
     if (req.id) this.autoApprovedIds.add(req.id);
     if (req.tool === "run_command") for (const p of writeTargets(this.commandOf(req.input), this.root)) this.written.add(p);
-    const detail = req.tool === "run_command" ? this.commandOf(req.input) : (this.pathOf(req.input) ?? req.tool);
-    this.opts.log?.(`[auto] ${req.agent}: ${detail.slice(0, 200)} - ${why}`);
+    this.logAuto("allow", source, req, why);
     // Classifier text is model-generated: show it as plain text, clipped.
     return { approved: true, autoApproved: why.replace(/\s+/g, " ").slice(0, 200) };
   }
@@ -534,7 +594,8 @@ export class Team implements TeamContext {
     if (askReason) askReason = askReason.replace(/\s+/g, " ").slice(0, 200);
     const isEdit = req.tool === "edit_file" || req.tool === "write_file";
     const target = isEdit ? this.editTarget(req) : undefined;
-    const sensitive = target !== undefined && isSensitivePath(target, this.root);
+    const sensitive =
+      target !== undefined && (isSensitivePath(target, this.root) || this.pkgRisk.get(normalizePath(target)) !== undefined);
     const r = await this.approvals.request(
       {
         id: req.id,

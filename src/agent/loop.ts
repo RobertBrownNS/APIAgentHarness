@@ -586,11 +586,7 @@ export class AgentSession implements AgentHandle {
           results.push(fail(`The user rejected this action${why}`, "rejected"));
           continue;
         }
-        if (decision.autoApproved) {
-          this.updateTool(tu.id, { autoApproved: decision.autoApproved });
-          const what = tu.name === "run_command" ? String((input as { command?: string }).command ?? "").slice(0, 200) : tu.name;
-          this.log(`[auto] ${what} — ${decision.autoApproved}`);
-        }
+        if (decision.autoApproved) this.updateTool(tu.id, { autoApproved: decision.autoApproved });
         if (signal.aborted) {
           results.push(fail("Stopped by user"));
           continue;

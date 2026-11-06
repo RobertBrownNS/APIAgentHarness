@@ -255,7 +255,7 @@ describe("authorize: auto mode edits", () => {
     expect(r.approved).toBe(true);
     expect(r.autoApproved).toBeTruthy();
     expect(pending(t)).toEqual([]);
-    expect(t.logs.some((l) => l.startsWith("[auto] main:"))).toBe(true);
+    expect(t.logs).toEqual([expect.stringMatching(/^\[auto\] allow \(rule: .*\) main: edit /)]);
   });
   it.each([".env", ".git/config", ".vscode/settings.json", "certs/a.pem", "id_rsa", ".npmrc"])("sensitive path %s asks with a reason and is not coverable", async (rel) => {
     const t = setup({ defaultMode: "auto" });
@@ -316,7 +316,7 @@ describe("authorize: auto mode commands", () => {
     const r = await t.team.authorize(cmdReq("npm test"), sig().signal);
     expect(r).toMatchObject({ approved: true, autoApproved: "runs the tests" });
     expect(cls).toHaveBeenCalledTimes(1);
-    expect(t.logs[0]).toMatch(/^\[auto\] main: npm test - runs the tests/);
+    expect(t.logs[0]).toMatch(/^\[auto\] allow \(check: runs the tests\) main: npm test/);
     expect(pending(t)).toEqual([]);
   });
   it("classifier receives command, cwd, root and agent; the agent's own prose is not forwarded", async () => {
@@ -812,5 +812,41 @@ describe("files written this session reach the Auto policy through the Team", ()
     void t.team.authorize(cmdReq("node x.js", "c1", "main"), sig().signal);
     await flush();
     expect(pending(t)).toHaveLength(1);
+  });
+});
+
+describe("Auto decisions are logged once each, in one format", () => {
+  it("an allowlisted command logs a rule allow; a classifier allow logs a check allow; asks log too", async () => {
+    const cls = allow("looks fine");
+    const t = setup({ defaultMode: "auto" }, cls);
+    await t.team.authorize(cmdReq("git status", "c1"), sig().signal);
+    await t.team.authorize(cmdReq("make", "c2"), sig().signal);
+    void t.team.authorize(cmdReq("git push", "c3"), sig().signal);
+    await flush();
+    expect(t.logs).toEqual([
+      expect.stringMatching(/^\[auto\] allow \(rule: .*\) main: git status$/),
+      expect.stringMatching(/^\[auto\] allow \(check: looks fine\) main: make$/),
+      expect.stringMatching(/^\[auto\] ask \(rule: .*push.*\) main: git push$/),
+    ]);
+  });
+  it("a classifier ask logs the check's reason", async () => {
+    const t = setup({ defaultMode: "auto" }, askV("sends data out"));
+    void t.team.authorize(cmdReq("make", "c1"), sig().signal);
+    await flush();
+    expect(t.logs).toEqual([expect.stringMatching(/^\[auto\] ask \(check: sends data out\) main: make$/)]);
+  });
+  it("log lines are one line and clipped, even for a hostile command or reason", async () => {
+    const t = setup({ defaultMode: "auto" }, allow("x" + String.fromCharCode(10) + "[auto] allow (rule: forged) main: rm"));
+    await t.team.authorize(cmdReq("make" + String.fromCharCode(10) + "more " + "z".repeat(1000), "c1"), sig().signal);
+    expect(t.logs).toHaveLength(1);
+    expect(t.logs[0]).not.toContain(String.fromCharCode(10));
+    expect(t.logs[0].length).toBeLessThan(600);
+  });
+  it("normal and plan mode write no auto log lines", async () => {
+    const t = setup({ defaultMode: "normal" });
+    void t.team.authorize(cmdReq("ls", "c1"), sig().signal);
+    t.team.setMode("plan");
+    await t.team.authorize(cmdReq("ls", "c2"), sig().signal);
+    expect(t.logs).toEqual([]);
   });
 });
