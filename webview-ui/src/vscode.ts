@@ -8,7 +8,7 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 
 interface PersistedState {
-  draft?: string;
+  drafts?: Record<string, string>;
 }
 
 let api: VsCodeApi | undefined;
@@ -31,13 +31,17 @@ function readState(): PersistedState {
   }
 }
 
-export function loadDraft(): string {
-  return readState().draft ?? "";
+export function loadDraft(agent: string): string {
+  return readState().drafts?.[agent] ?? "";
 }
 
-export function saveDraft(draft: string): void {
+export function saveDraft(agent: string, draft: string): void {
   try {
-    api?.setState({ ...readState(), draft });
+    const s = readState();
+    const drafts = { ...s.drafts };
+    if (draft) drafts[agent] = draft.slice(0, 20000);
+    else delete drafts[agent];
+    api?.setState({ ...s, drafts });
   } catch {
     /* ignore */
   }

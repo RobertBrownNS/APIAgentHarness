@@ -1,43 +1,51 @@
-import { KeyRound, Plus } from "lucide-react";
-import { EFFORTS, MODELS, type Effort, type SessionConfig } from "@shared/protocol";
+import { KeyRound, OctagonX, RotateCcw } from "lucide-react";
+import type { SessionConfig } from "@shared/protocol";
 import { post } from "@/vscode";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-export function Header({ config }: { config: SessionConfig }) {
-  const models: string[] = [...MODELS];
-  if (config.model && !models.includes(config.model)) models.unshift(config.model);
+function fmt(n: number): string {
+  return n < 1000 ? String(n) : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
+}
 
+export function Header({
+  config,
+  anyBusy,
+  totalTokens,
+  approvals,
+}: {
+  config: SessionConfig;
+  anyBusy: boolean;
+  totalTokens: number;
+  approvals: number;
+}) {
   return (
-    <div className="shrink-0 border-b px-2 py-1.5">
+    <div className="shrink-0 border-b bg-sidebar px-2 py-1.5">
       <div className="flex items-center gap-1.5">
-        <Select value={config.model || undefined} onValueChange={(model) => post({ type: "setModel", model })}>
-          <SelectTrigger className="min-w-0 flex-1" aria-label="Model">
-            <SelectValue placeholder="Model" />
-          </SelectTrigger>
-          <SelectContent>
-            {models.map((m) => (
-              <SelectItem key={m} value={m}>
-                {m}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={config.effort} onValueChange={(effort) => post({ type: "setEffort", effort: effort as Effort })}>
-          <SelectTrigger className="w-20 shrink-0" aria-label="Effort">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {EFFORTS.map((e) => (
-              <SelectItem key={e} value={e}>
-                {e}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button variant="secondary" size="sm" onClick={() => post({ type: "newChat" })} title="Start a new chat">
-          <Plus /> New
-        </Button>
+        <span className="min-w-0 truncate text-xs font-semibold" title={config.workspaceName}>
+          Agent Harness{config.workspaceName ? ` · ${config.workspaceName}` : ""}
+        </span>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {approvals > 0 && <Badge variant="warning">{approvals} awaiting approval</Badge>}
+          <span className="hidden text-[11px] text-muted-foreground sm:inline" title="Input + output tokens used by all agents">
+            {fmt(totalTokens)} tok total
+          </span>
+          {config.maxAutoTurns > 0 && (
+            <span
+              className="hidden text-[11px] text-muted-foreground sm:inline"
+              title="Agent-to-agent turns left before agents pause, and team output tokens used. Both refill when you send a message."
+            >
+              auto-turns {config.autoTurnsLeft}/{config.maxAutoTurns}
+              {config.maxTeamOutputTokens > 0 && ` · ${fmt(config.teamOutputTokens)}/${fmt(config.maxTeamOutputTokens)} tok`}
+            </span>
+          )}
+          <Button variant="outline" size="sm" disabled={!anyBusy} onClick={() => post({ type: "stop" })} title="Stop every agent's current turn">
+            <OctagonX /> Stop all
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => post({ type: "newTeam" })} title="Stop everything and start a fresh team">
+            <RotateCcw /> New team
+          </Button>
+        </div>
       </div>
       {!config.hasCredentials && (
         <div className="mt-1.5 flex items-center justify-between gap-2 rounded-md border border-warning/60 px-2 py-1 text-xs">

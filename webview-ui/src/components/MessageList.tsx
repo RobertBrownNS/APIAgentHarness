@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { ChatItem } from "@shared/protocol";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { UserBubble, AssistantText } from "@/components/MessageBubble";
 import { ThinkingBlock } from "@/components/ThinkingBlock";
 import { ToolCallCard } from "@/components/ToolCallCard";
 import { Notice } from "@/components/Notice";
+import { MessageCard } from "@/components/MessageCard";
 import { post } from "@/vscode";
 
 const EXAMPLES = [
@@ -13,29 +14,52 @@ const EXAMPLES = [
   "Run the tests and fix any failures",
 ];
 
-function Empty() {
+const MUser = memo(UserBubble);
+const MText = memo(AssistantText);
+const MThinking = memo(ThinkingBlock);
+const MTool = memo(ToolCallCard);
+const MNotice = memo(Notice);
+const MMessage = memo(MessageCard);
+
+function Empty({ agent, isLead, disabled }: { agent: string; isLead: boolean; disabled: boolean }) {
   return (
     <div className="flex flex-col gap-2 px-3 py-6 text-center">
-      <div className="text-sm font-medium">Agent Harness</div>
+      <div className="text-sm font-medium">{isLead ? "Agent Harness" : agent}</div>
       <div className="text-xs text-muted-foreground">
-        Ask the agent to read, search or change your workspace. Edits and commands ask for approval first.
+        {isLead
+          ? "Ask the lead to read, search or change your workspace. It can spawn teammates for parallel work. Edits and commands ask for approval first."
+          : "This teammate has no messages yet. Send it one below."}
       </div>
+      {isLead && !disabled && (
       <div className="mt-2 flex flex-col gap-1.5">
         {EXAMPLES.map((ex) => (
           <button
             key={ex}
-            onClick={() => post({ type: "send", text: ex })}
+            onClick={() => post({ type: "send", agent, text: ex })}
             className="cursor-pointer rounded-md border px-2 py-1.5 text-left text-xs hover:bg-accent"
           >
             {ex}
           </button>
         ))}
       </div>
+      )}
     </div>
   );
 }
 
-export function MessageList({ items, busy }: { items: ChatItem[]; busy: boolean }) {
+function MessageListImpl({
+  items,
+  busy,
+  agent,
+  isLead,
+  disabled,
+}: {
+  items: ChatItem[];
+  busy: boolean;
+  agent: string;
+  isLead: boolean;
+  disabled: boolean;
+}) {
   const viewport = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
@@ -68,21 +92,23 @@ export function MessageList({ items, busy }: { items: ChatItem[]; busy: boolean 
   return (
     <ScrollArea className="min-h-0 flex-1" viewportRef={viewport} onViewportScroll={onScroll}>
       {items.length === 0 ? (
-        <Empty />
+        <Empty agent={agent} isLead={isLead} disabled={disabled} />
       ) : (
         <div className="flex min-w-0 flex-col gap-2.5 p-2.5">
           {items.map((it) => {
             switch (it.kind) {
               case "user":
-                return <UserBubble key={it.id} text={it.text} />;
+                return <MUser key={it.id} text={it.text} />;
               case "text":
-                return <AssistantText key={it.id} text={it.text} />;
+                return <MText key={it.id} text={it.text} />;
               case "thinking":
-                return <ThinkingBlock key={it.id} text={it.text} streaming={busy && it === last} />;
+                return <MThinking key={it.id} text={it.text} streaming={busy && it === last} />;
               case "tool":
-                return <ToolCallCard key={it.id} item={it} />;
+                return <MTool key={it.id} item={it} />;
               case "notice":
-                return <Notice key={it.id} level={it.level} text={it.text} />;
+                return <MNotice key={it.id} level={it.level} text={it.text} />;
+              case "message":
+                return <MMessage key={it.id} item={it} viewer={agent} />;
             }
           })}
         </div>
@@ -90,3 +116,5 @@ export function MessageList({ items, busy }: { items: ChatItem[]; busy: boolean 
     </ScrollArea>
   );
 }
+
+export const MessageList = memo(MessageListImpl);

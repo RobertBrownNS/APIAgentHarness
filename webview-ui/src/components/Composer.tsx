@@ -4,11 +4,12 @@ import { loadDraft, post, saveDraft } from "@/vscode";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 
-export function Composer({ busy }: { busy: boolean }) {
-  const [text, setText] = useState(loadDraft);
+/** Remount with key={agent} so each agent keeps its own draft. */
+export function Composer({ agent, busy, disabled, paused = false }: { agent: string; busy: boolean; disabled: boolean; paused?: boolean }) {
+  const [text, setText] = useState(() => loadDraft(agent));
   const ref = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => saveDraft(text), [text]);
+  useEffect(() => saveDraft(agent, text), [agent, text]);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -20,8 +21,8 @@ export function Composer({ busy }: { busy: boolean }) {
   // The draft is only cleared when a message is actually sent.
   const send = () => {
     const t = text.trim();
-    if (!t || busy) return;
-    post({ type: "send", text: t });
+    if (!t || disabled) return;
+    post({ type: "send", agent, text: t });
     setText("");
   };
 
@@ -32,7 +33,10 @@ export function Composer({ busy }: { busy: boolean }) {
           ref={ref}
           rows={1}
           value={text}
-          placeholder="Ask the agent… (Enter to send, Shift+Enter for newline)"
+          disabled={disabled}
+          placeholder={
+            disabled ? `${agent} was removed from the team` : paused ? `Message ${agent} (this will resume it)` : `Message ${agent}… (Enter to send, Shift+Enter for newline)`
+          }
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -42,16 +46,20 @@ export function Composer({ busy }: { busy: boolean }) {
           }}
           className="min-h-7 flex-1"
         />
-        {busy ? (
-          <Button variant="destructive" size="icon" onClick={() => post({ type: "stop" })} title="Stop">
+        {busy && (
+          <Button variant="destructive" size="icon" onClick={() => post({ type: "stop", agent })} title={`Stop ${agent}`}>
             <Square />
           </Button>
-        ) : (
-          <Button size="icon" onClick={send} disabled={!text.trim()} title="Send">
-            <SendHorizontal />
-          </Button>
         )}
+        <Button size="icon" onClick={send} disabled={disabled || !text.trim()} title={busy ? "Queue message" : "Send"}>
+          <SendHorizontal />
+        </Button>
       </div>
+      {busy && !disabled && (
+        <div className="mt-1 text-[11px] text-muted-foreground">
+          {agent} is busy: a message you send is queued and delivered when the current turn ends.
+        </div>
+      )}
     </div>
   );
 }

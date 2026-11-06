@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useContext, useState } from "react";
 import {
   AlertCircle,
   Ban,
@@ -18,7 +18,7 @@ import type { ChatItem, ToolStatus } from "@shared/protocol";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { ApprovalCard } from "@/components/ApprovalCard";
+import { ShowQueueContext } from "@/lib/ui-context";
 import { cn } from "@/lib/utils";
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
@@ -152,8 +152,9 @@ function Details({ item, skipInput }: { item: ToolItem; skipInput: boolean }) {
   );
 }
 
-export function ToolCallCard({ item }: { item: ToolItem }) {
+export function ToolCallCard({ item, footer }: { item: ToolItem; footer?: React.ReactNode }) {
   const [open, setOpen] = useState(false);
+  const showQueue = useContext(ShowQueueContext);
   const Icon = ICONS[item.name] ?? Wrench;
   const input = asRecord(item.input);
   const summary = summarize(item.name, item.input);
@@ -188,6 +189,7 @@ export function ToolCallCard({ item }: { item: ToolItem }) {
               <span className="select-none text-muted-foreground">$ </span>
               {command}
             </pre>
+            {str(input.cwd) && <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">in {str(input.cwd)}</div>}
           </CardContent>
         )}
         <CollapsibleContent>
@@ -197,7 +199,15 @@ export function ToolCallCard({ item }: { item: ToolItem }) {
         </CollapsibleContent>
         {awaiting && (
           <CardContent>
-            <ApprovalCard id={item.id} allowApproveAll={item.name === "edit_file" || item.name === "write_file"} />
+            {footer ?? (
+              <button
+                type="button"
+                onClick={showQueue}
+                className="cursor-pointer text-xs text-warning underline-offset-2 hover:underline"
+              >
+                Waiting in the approval queue
+              </button>
+            )}
           </CardContent>
         )}
       </Collapsible>

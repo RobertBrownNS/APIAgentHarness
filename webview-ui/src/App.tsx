@@ -1,53 +1,35 @@
-import { useEffect, useReducer } from "react";
-import type { ChatItem, HostMessage, SessionConfig } from "@shared/protocol";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import type { HostMessage } from "@shared/protocol";
+import { LEAD } from "@shared/protocol";
 import { post } from "@/vscode";
+import { initialState, reducer } from "@/lib/state";
+import { ShowQueueContext } from "@/lib/ui-context";
 import { Header } from "@/components/Header";
-import { MessageList } from "@/components/MessageList";
-import { Composer } from "@/components/Composer";
+import { Roster } from "@/components/Roster";
+import { ChatPane } from "@/components/ChatPane";
+import { ApprovalQueue } from "@/components/ApprovalQueue";
+import { TaskBoard } from "@/components/TaskBoard";
+import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { cn } from "@/lib/utils";
 
-interface State {
-  items: ChatItem[];
-  busy: boolean;
-  config: SessionConfig;
-}
+const NARROW = 700;
+type Tab = "team" | "chat" | "work";
 
-const initial: State = {
-  items: [],
-  busy: false,
-  config: { model: "", effort: "medium", hasCredentials: true },
-};
-
-function reducer(state: State, msg: HostMessage): State {
-  switch (msg.type) {
-    case "snapshot":
-      return { items: msg.items, busy: msg.busy, config: msg.config };
-    case "item": {
-      const i = state.items.findIndex((it) => it.id === msg.item.id);
-      if (i < 0) return { ...state, items: [...state.items, msg.item] };
-      const items = state.items.slice();
-      items[i] = msg.item;
-      return { ...state, items };
-    }
-    case "append": {
-      const i = state.items.findIndex((it) => it.id === msg.id);
-      if (i < 0) return state;
-      const it = state.items[i];
-      if (it.kind !== "text" && it.kind !== "thinking") return state;
-      const items = state.items.slice();
-      items[i] = { ...it, text: it.text + msg.text };
-      return { ...state, items };
-    }
-    case "busy":
-      return { ...state, busy: msg.busy };
-    case "config":
-      return { ...state, config: msg.config };
-    default:
-      return state;
-  }
+function SectionTitle({ children, count }: { children: React.ReactNode; count?: number }) {
+  return (
+    <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+      {children}
+      {count ? <Badge variant="warning">{count}</Badge> : null}
+    </div>
+  );
 }
 
 export default function App() {
-  const [state, dispatch] = useReducer(reducer, initial);
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const [tab, setTab] = useState<Tab>("chat");
+  const [narrow, setNarrow] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const onMessage = (e: MessageEvent<HostMessage>) => {
@@ -58,11 +40,111 @@ export default function App() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
+  useLayoutEffect(() => {
+    const el = root.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setNarrow(el.clientWidth < NARROW));
+    ro.observe(el);
+    setNarrow(el.clientWidth < NARROW);
+    return () => ro.disconnect();
+  }, []);
+
+  const select = useCallback((agent: string) => {
+    dispatch({ type: "select", agent });
+    setTab("chat");
+  }, []);
+  const showQueue = useCallback(() => setTab("work"), []);
+
+  const { agents, selected, approvals, tasks, config } = state;
+  const current = agents.find((a) => a.name === selected) ?? agents.find((a) => a.name === LEAD);
+  const anyBusy = agents.some((a) => a.status === "running" || a.status === "awaiting");
+  const teammateCount = agents.filter((a) => !a.isLead && a.status !== "stopped").length;
+  const unreadTotal = useMemo(
+    () => Object.entries(state.unread).reduce((n, [k, v]) => (k === selected ? n : n + v), 0),
+    [state.unread, selected],
+  );
+
+  const roster = (
+    <Roster
+      agents={agents}
+      selected={selected}
+      unread={state.unread}
+      teammateCount={teammateCount}
+      maxTeammates={config.maxTeammates}
+      defaultModel={config.teammateModel || config.model}
+      onSelect={select}
+    />
+  );
+  const chat = current ? (
+    <ChatPane agent={current} items={state.transcripts[current.name] ?? []} />
+  ) : (
+    <div className="p-4 text-center text-xs text-muted-foreground">{state.loaded ? "No agents." : "Starting…"}</div>
+  );
+  const queue = <ApprovalQueue approvals={approvals} onSelectAgent={select} />;
+  const board = <TaskBoard tasks={tasks} agents={agents} />;
+
   return (
-    <div className="flex h-full min-w-0 flex-col">
-      <Header config={state.config} />
-      <MessageList items={state.items} busy={state.busy} />
-      <Composer busy={state.busy} />
-    </div>
+    <ShowQueueContext.Provider value={showQueue}>
+      <div ref={root} className="flex h-full min-w-0 flex-col">
+        <Header config={config} anyBusy={anyBusy} totalTokens={agents.reduce((n, a) => n + a.inputTokens + a.outputTokens, 0)} approvals={approvals.length} />
+        {narrow ? (
+          <>
+            <div role="tablist" className="flex shrink-0 border-b bg-sidebar">
+              {(
+                [
+                  ["team", "Team", unreadTotal, "default"],
+                  ["chat", "Chat", 0, "default"],
+                  ["work", "Approvals & tasks", approvals.length, "warning"],
+                ] as const
+              ).map(([id, label, n, variant]) => (
+                <button
+                  key={id}
+                  role="tab"
+                  aria-selected={tab === id}
+                  onClick={() => setTab(id)}
+                  className={cn(
+                    "flex flex-1 cursor-pointer items-center justify-center gap-1 border-b-2 border-transparent px-2 py-1.5 text-xs hover:bg-accent",
+                    tab === id && "border-ring font-semibold",
+                  )}
+                >
+                  {label}
+                  {n > 0 && <Badge variant={variant}>{n}</Badge>}
+                </button>
+              ))}
+            </div>
+            <div className="min-h-0 flex-1 bg-sidebar/0">
+              {tab === "team" && <div className="h-full bg-sidebar">{roster}</div>}
+              {tab === "chat" && chat}
+              {tab === "work" && (
+                <ScrollArea className="h-full">
+                  <SectionTitle count={approvals.length}>Approvals</SectionTitle>
+                  {queue}
+                  <SectionTitle>Tasks</SectionTitle>
+                  {board}
+                </ScrollArea>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="flex min-h-0 flex-1">
+            <aside className="flex w-[220px] shrink-0 flex-col border-r bg-sidebar">
+              <SectionTitle>Team</SectionTitle>
+              <div className="min-h-0 flex-1">{roster}</div>
+            </aside>
+            <main className="min-w-0 flex-1">{chat}</main>
+            <aside className="flex w-[340px] shrink-0 flex-col border-l bg-sidebar">
+              <div className="flex min-h-0 basis-1/2 flex-col border-b">
+                <SectionTitle count={approvals.length}>Approvals</SectionTitle>
+                <ScrollArea className="min-h-0 flex-1">{queue}</ScrollArea>
+              </div>
+              <div className="flex min-h-0 basis-1/2 flex-col">
+                <SectionTitle>Tasks</SectionTitle>
+                <ScrollArea className="min-h-0 flex-1">{board}</ScrollArea>
+              </div>
+            </aside>
+          </div>
+        )}
+      </div>
+    </ShowQueueContext.Provider>
   );
 }

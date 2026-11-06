@@ -21,25 +21,22 @@
     }
   },
   "contributes": {
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "agentHarness",
-          "title": "Agent Harness",
-          "icon": "media/icon.svg"
-        }
-      ]
-    },
-    "views": {
-      "agentHarness": [
-        {
-          "type": "webview",
-          "id": "agentHarness.chat",
-          "name": "Chat"
-        }
-      ]
-    },
     "commands": [
+      {
+        "command": "agentHarness.open",
+        "title": "Open",
+        "category": "Agent Harness"
+      },
+      {
+        "command": "agentHarness.newTeam",
+        "title": "New Team",
+        "category": "Agent Harness"
+      },
+      {
+        "command": "agentHarness.stopAll",
+        "title": "Stop All Agents",
+        "category": "Agent Harness"
+      },
       {
         "command": "agentHarness.setApiKey",
         "title": "Set API Key",
@@ -49,29 +46,8 @@
         "command": "agentHarness.clearApiKey",
         "title": "Clear API Key",
         "category": "Agent Harness"
-      },
-      {
-        "command": "agentHarness.newChat",
-        "title": "New Chat",
-        "category": "Agent Harness",
-        "icon": "$(add)"
-      },
-      {
-        "command": "agentHarness.stop",
-        "title": "Stop",
-        "category": "Agent Harness",
-        "icon": "$(debug-stop)"
       }
     ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "agentHarness.newChat",
-          "when": "view == agentHarness.chat",
-          "group": "navigation"
-        }
-      ]
-    },
     "configuration": {
       "title": "Agent Harness",
       "properties": {
@@ -82,7 +58,13 @@
         },
         "agentHarness.effort": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "high",
           "description": "How much effort (thinking depth and token spend) the model puts into each turn."
         },
@@ -105,6 +87,35 @@
           "type": "boolean",
           "default": true,
           "description": "If the model declines a request, let the API retry it on a fallback model automatically."
+        },
+        "agentHarness.teammateModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for new teammates. Empty means the same as the lead (agentHarness.model)."
+        },
+        "agentHarness.maxTeammates": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "Maximum number of teammates (not counting the lead)."
+        },
+        "agentHarness.maxAutoTurns": {
+          "type": "number",
+          "default": 40,
+          "minimum": 1,
+          "description": "Maximum automatic (message-triggered) agent turns per team before agents pause; refilled whenever you send a message."
+        },
+        "agentHarness.maxTurnIterations": {
+          "type": "number",
+          "default": 40,
+          "minimum": 1,
+          "description": "Maximum model calls in a single agent turn before the turn ends with a notice."
+        },
+        "agentHarness.maxTeamOutputTokens": {
+          "type": "number",
+          "default": 1500000,
+          "minimum": 1000,
+          "description": "Team-wide budget in output-equivalent tokens (output tokens plus input and cache tokens, weighted by price). When it is used up, all agents pause. It refills when you send a message."
         }
       }
     }

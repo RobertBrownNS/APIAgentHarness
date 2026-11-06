@@ -4,11 +4,17 @@ import { post } from "@/vscode";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 
-export function ApprovalCard({ id, allowApproveAll = false }: { id: string; allowApproveAll?: boolean }) {
+export function ApprovalCard({ id, agent, allowApproveAll = false }: { id: string; agent: string; allowApproveAll?: boolean }) {
+  const [sent, setSent] = useState(false);
+  const decide = (decision: "approve" | "approveAll" | "reject", reason?: string) => {
+    if (sent) return;
+    setSent(true);
+    post({ type: "approval", id, decision, reason });
+  };
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
 
-  const reject = () => post({ type: "approval", id, decision: "reject", reason: reason.trim() || undefined });
+  const reject = () => decide("reject", reason.trim() || undefined);
 
   if (rejecting) {
     return (
@@ -27,7 +33,7 @@ export function ApprovalCard({ id, allowApproveAll = false }: { id: string; allo
           }}
         />
         <div className="flex gap-1.5">
-          <Button variant="destructive" size="sm" onClick={reject}>
+          <Button variant="destructive" size="sm" disabled={sent} onClick={reject}>
             <X /> Reject
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setRejecting(false)}>
@@ -40,20 +46,21 @@ export function ApprovalCard({ id, allowApproveAll = false }: { id: string; allo
 
   return (
     <div className="flex flex-wrap gap-1.5">
-      <Button size="sm" onClick={() => post({ type: "approval", id, decision: "approve" })}>
+      <Button size="sm" disabled={sent} onClick={() => decide("approve")}>
         <Check /> Approve
       </Button>
       {allowApproveAll && (
       <Button
         variant="secondary"
         size="sm"
-        title="Approve this and all further file edits in this chat. Commands always ask."
-        onClick={() => post({ type: "approval", id, decision: "approveAll" })}
+        disabled={sent}
+        title={`Approve this and all further file edits by ${agent}. Commands always ask.`}
+        onClick={() => decide("approveAll")}
       >
-        <CheckCheck /> Approve all edits
+        <CheckCheck /> Approve all edits by {agent}
       </Button>
       )}
-      <Button variant="outline" size="sm" onClick={() => setRejecting(true)}>
+      <Button variant="outline" size="sm" disabled={sent} onClick={() => setRejecting(true)}>
         <X /> Reject
       </Button>
     </div>

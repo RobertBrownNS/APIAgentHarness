@@ -1,18 +1,28 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as vscode from "vscode";
-import type { ChatItem, Effort, HostMessage } from "../shared/protocol";
-import { ApprovalBroker, type ApprovalResult } from "./approvals";
+import type { AgentInfo, AgentStatus, ChatItem, Effort } from "../shared/protocol";
+import type { AgentEvents, AgentHandle, AgentOptions, TeamContext } from "../team/types";
+import { isTeamTool, runTeamTool, teamToolDefinitions } from "../team/teamTools";
 import { createClient } from "./client";
-import { buildSystemPrompt } from "./systemPrompt";
+import { confinePath } from "./paths";
+import { buildLeadPrompt, buildTeammatePrompt } from "./systemPrompt";
 import { MUTATING, parseToolInput, runTool, ToolError, toolDefinitions } from "./tools";
 
 type Msg = Anthropic.Beta.BetaMessageParam;
 type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 
+/** Extension-wide services every AgentSession needs. Call once from activate(). */
+export interface AgentRuntime {
+  secrets: vscode.SecretStorage;
+  output: vscode.OutputChannel;
+}
+let runtime: AgentRuntime | undefined;
+export function configureAgentRuntime(r: AgentRuntime): void {
+  runtime = r;
+}
+
 interface Settings {
-  model: string;
-  effort: Effort;
   maxTokens: number;
   autoApproveReads: boolean;
   commandTimeoutSec: number;
@@ -20,9 +30,11 @@ interface Settings {
 }
 
 interface Run {
-  gen: number;
   signal: AbortSignal;
   msgs: Msg[];
+  system: string;
+  model: string;
+  effort: Effort;
 }
 
 const MAX_UI_OUTPUT = 20_000;
@@ -35,20 +47,41 @@ function clip(s: string): string {
     : s;
 }
 
-/** One chat: message history sent to the API plus the transcript shown in the panel. */
-export class AgentSession {
-  readonly approvals = new ApprovalBroker();
+/** One team member: message history sent to the API plus the transcript shown in the panel. */
+export class AgentSession implements AgentHandle {
+  readonly name: string;
+  private readonly isLead: boolean;
+  private readonly role: string;
+  private readonly spawnedBy: AgentInfo["spawnedBy"];
+  private readonly team: TeamContext;
+  private readonly events: AgentEvents;
+  private model: string;
+  private effort: Effort;
+
   private messages: Msg[] = [];
   private items: ChatItem[] = [];
   private abort?: AbortController;
   private _busy = false;
+  private paused = false;
+  private disposed = false;
+  private pendingApprovals = 0;
+  private outputTokens = 0;
+  private inputTokens = 0;
+  private turnErrored = false;
+  private errorText = "";
+  private lastText = "";
   private nextId = 1;
 
-  constructor(
-    private readonly context: vscode.ExtensionContext,
-    private readonly output: vscode.OutputChannel,
-    private readonly emit: (m: HostMessage) => void,
-  ) {}
+  constructor(opts: AgentOptions) {
+    this.name = opts.name;
+    this.isLead = opts.isLead;
+    this.role = opts.role;
+    this.model = opts.model;
+    this.effort = opts.effort;
+    this.spawnedBy = opts.spawnedBy;
+    this.team = opts.team;
+    this.events = opts.events;
+  }
 
   get busy(): boolean {
     return this._busy;
@@ -58,38 +91,76 @@ export class AgentSession {
     return this.items;
   }
 
-  // ---- transcript helpers ----
+  info(): AgentInfo {
+    let status: AgentStatus = "idle";
+    if (this.disposed) status = "stopped";
+    else if (this._busy) status = this.pendingApprovals > 0 ? "awaiting" : "running";
+    else if (this.paused) status = "paused";
+    return {
+      name: this.name,
+      isLead: this.isLead,
+      role: this.role,
+      model: this.model,
+      effort: this.effort,
+      status,
+      spawnedBy: this.spawnedBy,
+      outputTokens: this.outputTokens,
+      inputTokens: this.inputTokens,
+      pendingMail: this.pendingMailSafe(),
+    };
+  }
 
-  private gen = 0;
+  private pendingMailSafe(): number {
+    try {
+      return this.team.mailbox.pending(this.name);
+    } catch {
+      return 0; // team already closed
+    }
+  }
+
+  private emitInfo(): void {
+    try {
+      this.events.info(this.info());
+    } catch {
+      /* team already closed */
+    }
+  }
+
+  // ---- transcript helpers ----
 
   private uid(prefix: string): string {
     return `${prefix}-${this.nextId++}`;
   }
 
-  private upsert(item: ChatItem, gen = this.gen): void {
-    if (gen !== this.gen) return; // stale run after reset()
+  private upsert(item: ChatItem): void {
     const i = this.items.findIndex((x) => x.id === item.id);
     if (i >= 0) this.items[i] = item;
     else this.items.push(item);
-    this.emit({ type: "item", item });
+    this.events.item(item);
   }
 
-  private append(id: string, text: string, gen = this.gen): void {
-    if (gen !== this.gen) return;
+  private append(id: string, text: string): void {
     const it = this.items.find((x) => x.id === id);
     if (!it || (it.kind !== "text" && it.kind !== "thinking")) return;
     it.text += text;
-    this.emit({ type: "append", id, text });
+    this.events.append(id, text);
   }
 
-  private notice(level: "info" | "error", text: string, gen = this.gen): void {
-    this.upsert({ kind: "notice", id: this.uid("notice"), level, text }, gen);
+  private notice(level: "info" | "error", text: string): void {
+    if (level === "error") {
+      this.turnErrored = true;
+      this.errorText = text;
+    }
+    this.upsert({ kind: "notice", id: this.uid("notice"), level, text });
   }
 
-  private updateTool(id: string, patch: Partial<ToolItem>, gen = this.gen): void {
-    if (gen !== this.gen) return;
+  private updateTool(id: string, patch: Partial<ToolItem>): void {
     const it = this.items.find((x) => x.id === id);
-    if (it?.kind === "tool") this.upsert({ ...it, ...patch }, gen);
+    if (it?.kind === "tool") this.upsert({ ...it, ...patch });
+  }
+
+  private log(line: string): void {
+    runtime?.output.appendLine(`[${this.name}] ${line}`);
   }
 
   // ---- public API ----
@@ -97,42 +168,67 @@ export class AgentSession {
   stop(): void {
     if (!this._busy || !this.abort || this.abort.signal.aborted) return;
     this.abort.abort();
-    this.approvals.cancelAll("stopped by user");
+    this.team.approvals.cancelAgent(this.name, "stopped by user");
     this.notice("info", "Stopped.");
   }
 
-  reset(): void {
-    this.gen++; // any run still unwinding becomes a no-op
-    this.abort?.abort();
-    this.approvals.reset();
-    this.messages = [];
-    this.items = [];
-    this._busy = false;
-    this.emit({ type: "busy", busy: false });
+  setModel(model: string): void {
+    this.model = model;
+    this.emitInfo();
   }
 
-  async send(text: string): Promise<void> {
-    if (this._busy || typeof text !== "string" || !text.trim()) return;
+  setEffort(effort: Effort): void {
+    this.effort = effort;
+    this.emitInfo();
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    this.emitInfo();
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.abort?.abort();
+    try {
+      this.team.approvals.cancelAgent(this.name, "agent stopped");
+    } catch {
+      /* team already closed */
+    }
+    this.emitInfo();
+  }
+
+  async send(
+    text: string,
+    kind: "user" | "mail",
+  ): Promise<{ ended: "done" | "stopped" | "error"; lastText: string; error?: string }> {
+    if (this._busy || this.disposed || typeof text !== "string" || !text.trim()) {
+      return { ended: "stopped", lastText: "" };
+    }
     this._busy = true; // claim synchronously so a double send can't start two loops
-    const gen = this.gen;
     const abort = new AbortController();
     this.abort = abort;
-    this.emit({ type: "busy", busy: true });
+    this.turnErrored = false;
+    this.lastText = "";
+    this.errorText = "";
+    this.emitInfo();
     const msgs = this.messages;
     try {
-      this.upsert({ kind: "user", id: this.uid("user"), text }, gen);
+      if (kind === "user") this.upsert({ kind: "user", id: this.uid("user"), text });
 
-      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      if (!root) {
-        this.notice("error", "Open a folder or workspace first; the agent works inside it.", gen);
-        return;
+      if (!runtime) {
+        this.notice("error", "Agent runtime is not configured.");
+        return this.result(abort);
       }
-      const client = await createClient(this.context.secrets);
+      const base = await createClient(runtime.secrets);
+      const client = base?.withOptions({ maxRetries: 5 }); // parallel agents hit 429/529 more often
       if (!client) {
-        this.notice("error", "No API key found. Run 'Agent Harness: Set API Key'.", gen);
-        return;
+        this.notice("error", "No API key found. Run 'Agent Harness: Set API Key'.");
+        return this.result(abort);
       }
-      if (gen !== this.gen) return;
+      if (abort.signal.aborted) return this.result(abort);
 
       // Merge into a trailing user message (after Stop or an API error) to keep roles alternating.
       const last = msgs[msgs.length - 1];
@@ -147,69 +243,90 @@ export class AgentSession {
 
       const cfg = vscode.workspace.getConfiguration("agentHarness");
       const settings: Settings = {
-        model: cfg.get<string>("model", "claude-opus-5-5"),
-        effort: cfg.get<Effort>("effort", "high"),
         maxTokens: cfg.get<number>("maxTokens", 64000),
         autoApproveReads: cfg.get<boolean>("autoApproveReads", true),
         commandTimeoutSec: cfg.get<number>("commandTimeoutSec", 120),
         refusalFallback: cfg.get<boolean>("refusalFallback", true),
       };
-      await this.runLoop({ gen, signal: abort.signal, msgs }, client, root, settings);
+      const root = this.team.root;
+      const system = this.isLead
+        ? buildLeadPrompt(root)
+        : buildTeammatePrompt(root, { name: this.name, role: this.role });
+      await this.runLoop({ signal: abort.signal, msgs, system, model: this.model, effort: this.effort }, client, settings);
     } catch (err) {
-      this.reportError(err, gen, abort.signal);
+      this.reportError(err, abort.signal);
     } finally {
-      if (gen === this.gen) {
-        // Anything still in flight (after Stop or an error) is no longer running.
-        for (const it of [...this.items]) {
-          if (it.kind === "tool" && (it.status === "streaming" || it.status === "awaiting" || it.status === "running")) {
-            this.upsert({ ...it, status: "error" }, gen);
-          }
+      // Anything still in flight (after Stop or an error) is no longer running.
+      for (const it of [...this.items]) {
+        if (it.kind === "tool" && (it.status === "streaming" || it.status === "awaiting" || it.status === "running")) {
+          this.upsert({ ...it, status: "error" });
         }
-        this._busy = false;
-        this.emit({ type: "busy", busy: false });
       }
+      this.pendingApprovals = 0;
+      this._busy = false;
+      this.emitInfo();
     }
+    return this.result(abort);
   }
 
-  private reportError(err: unknown, gen: number, signal: AbortSignal): void {
-    if (err instanceof Anthropic.APIUserAbortError || signal.aborted || gen !== this.gen) return;
-    this.output.appendLine(`[error] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+  private result(abort: AbortController): { ended: "done" | "stopped" | "error"; lastText: string; error?: string } {
+    const ended = abort.signal.aborted || this.disposed ? "stopped" : this.turnErrored ? "error" : "done";
+    return { ended, lastText: this.lastText, ...(ended === "error" ? { error: this.errorText } : {}) };
+  }
+
+  private reportError(err: unknown, signal: AbortSignal): void {
+    if (err instanceof Anthropic.APIUserAbortError || signal.aborted) return;
+    this.log(`[error] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     if (err instanceof Anthropic.AuthenticationError) {
-      this.notice("error", "Invalid API key. Run 'Agent Harness: Set API Key'.", gen);
+      this.notice("error", "Invalid API key. Run 'Agent Harness: Set API Key'.");
     } else if (err instanceof Anthropic.RateLimitError) {
-      this.notice("error", "Rate limited by the API. Wait a moment and try again.", gen);
+      this.notice("error", "Rate limited by the API. This agent's turn ended; send it a message to continue.");
     } else if (err instanceof Anthropic.APIError) {
       if (err.status === 400 && /too long|context window|exceed/i.test(err.message)) {
-        this.notice("error", "This chat is too long for the model's context window. Start a New Chat.", gen);
+        this.notice("error", "This chat is too long for the model's context window. Start a New Team.");
       } else {
-        this.notice("error", `API error${err.status ? ` ${err.status}` : ""}: ${err.message}`, gen);
+        this.notice("error", `API error${err.status ? ` ${err.status}` : ""}: ${err.message}`);
       }
     } else {
-      this.notice("error", `Error: ${err instanceof Error ? err.message : String(err)}`, gen);
+      this.notice("error", `Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   // ---- the loop ----
 
-  private async runLoop(run: Run, client: Anthropic, root: string, s: Settings): Promise<void> {
-    const { gen, signal, msgs } = run;
-    const system = buildSystemPrompt(root);
+  private async runLoop(run: Run, client: Anthropic, s: Settings): Promise<void> {
+    const { signal, msgs, system } = run;
+    const tools = [...toolDefinitions, ...teamToolDefinitions(this.isLead)];
     let retries = 0;
 
-    while (!signal.aborted && gen === this.gen) {
+    const cfgMax = vscode.workspace.getConfiguration("agentHarness").get<number>("maxTurnIterations", 40);
+    const maxIter = Number.isFinite(cfgMax) && cfgMax > 0 ? cfgMax : 40;
+    let iter = 0;
+    while (!signal.aborted) {
+      if (iter++ >= maxIter) {
+        this.lastText = `${this.lastText}
+(turn stopped at the iteration limit; work may be incomplete)`.trim();
+        this.notice("info", `Stopped after ${maxIter} model calls in one turn (agentHarness.maxTurnIterations).`);
+        return;
+      }
       // Content block index -> UI item. Text/thinking items are created on the first delta so none are empty.
       const blockItem = new Map<number, { id: string; kind: "text" | "thinking"; created: boolean }>();
       const toolChars = new Map<number, { id: string; chars: number; at: number }>();
       const attemptTools: string[] = [];
 
+      if (!this.team.allowModelCall(this.name)) {
+        this.notice("info", "Team budget reached; this turn ended.");
+        return;
+      }
+      // model/effort are read per iteration so a change in the UI applies to the next request
       const params: Parameters<typeof client.beta.messages.stream>[0] = {
-        model: s.model,
+        model: this.model,
         max_tokens: s.maxTokens,
         system,
-        tools: toolDefinitions,
+        tools,
         messages: msgs,
         thinking: { type: "adaptive", display: "summarized" },
-        output_config: { effort: s.effort },
+        output_config: { effort: this.effort },
         cache_control: { type: "ephemeral" },
         ...(s.refusalFallback ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
       };
@@ -223,7 +340,7 @@ export class AgentSession {
           } else if (b.type === "tool_use") {
             toolChars.set(ev.index, { id: b.id, chars: 0, at: 0 });
             attemptTools.push(b.id);
-            this.upsert({ kind: "tool", id: b.id, name: b.name, status: "streaming", inputChars: 0 }, gen);
+            this.upsert({ kind: "tool", id: b.id, name: b.name, status: "streaming", inputChars: 0 });
           }
         } else if (ev.type === "content_block_delta") {
           const d = ev.delta;
@@ -233,9 +350,9 @@ export class AgentSession {
             if (!info || !piece) return;
             if (!info.created) {
               info.created = true;
-              this.upsert({ kind: info.kind, id: info.id, text: piece }, gen);
+              this.upsert({ kind: info.kind, id: info.id, text: piece });
             } else {
-              this.append(info.id, piece, gen);
+              this.append(info.id, piece);
             }
           } else if (d.type === "input_json_delta") {
             const t = toolChars.get(ev.index);
@@ -244,7 +361,7 @@ export class AgentSession {
             const now = Date.now();
             if (now - t.at >= INPUT_UPDATE_MS) {
               t.at = now;
-              this.updateTool(t.id, { inputChars: t.chars }, gen);
+              this.updateTool(t.id, { inputChars: t.chars });
             }
           }
         }
@@ -260,22 +377,39 @@ export class AgentSession {
         const unparseable = err instanceof SyntaxError || /json/i.test(err instanceof Error ? err.message : "");
         if (unparseable && retries < MAX_RETRIES) {
           retries++;
-          this.output.appendLine(`[retry ${retries}] ${err instanceof Error ? err.message : String(err)}`);
+          this.log(`[retry ${retries}] ${err instanceof Error ? err.message : String(err)}`);
           for (const id of attemptTools) {
-            this.updateTool(id, { status: "error", output: "Model sent invalid input; retrying." }, gen);
+            this.updateTool(id, { status: "error", output: "Model sent invalid input; retrying." });
           }
-          this.notice("info", "The model produced an invalid tool call. Retrying.", gen);
+          this.notice("info", "The model produced an invalid tool call. Retrying.");
           continue;
         }
         throw err;
       }
       retries = 0;
-      if (gen !== this.gen) return;
 
       const u = message.usage;
-      this.output.appendLine(
+      this.outputTokens += u.output_tokens ?? 0;
+      const inTok = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      this.inputTokens += inTok;
+      const withinBudget = this.team.recordUsage(this.name, {
+        input: inTok,
+        output: u.output_tokens ?? 0,
+        uncachedInput: u.input_tokens ?? 0,
+        cacheRead: u.cache_read_input_tokens ?? 0,
+        cacheWrite: u.cache_creation_input_tokens ?? 0,
+      });
+      this.emitInfo();
+      this.log(
         `[usage] input=${u.input_tokens} output=${u.output_tokens} cache_read=${u.cache_read_input_tokens ?? 0} cache_write=${u.cache_creation_input_tokens ?? 0} stop=${message.stop_reason}`,
       );
+
+      const text = message.content
+        .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      this.lastText = text;
 
       const content = message.content as unknown as Anthropic.Beta.BetaContentBlockParam[];
       const pushAssistant = () => {
@@ -286,11 +420,15 @@ export class AgentSession {
       if (message.stop_reason === "refusal") {
         pushAssistant();
         const why = message.stop_details?.explanation;
-        this.notice("error", `The model declined this request${why ? `: ${why}` : "."}`, gen);
+        this.notice("error", `The model declined this request${why ? `: ${why}` : "."}`);
         return;
       }
       if (message.stop_reason === "pause_turn") {
         pushAssistant();
+        if (!withinBudget) {
+          this.notice("info", "Team budget reached; this turn ended.");
+          return;
+        }
         continue;
       }
       if (toolUses.length > 0 && message.stop_reason === "max_tokens") {
@@ -298,22 +436,30 @@ export class AgentSession {
         this.notice(
           "error",
           "The response was cut off (max tokens reached) before the tool call finished. Try again or raise agentHarness.maxTokens.",
-          gen,
         );
         return;
       }
       if (toolUses.length === 0) {
         pushAssistant();
         if (message.stop_reason === "max_tokens") {
-          this.notice("info", "The response was cut off (max tokens reached).", gen);
+          this.notice("info", "The response was cut off (max tokens reached).");
         }
         return;
       }
 
       // Keep the full assistant content (thinking blocks unchanged); answer every tool_use in one user message.
       msgs.push({ role: "assistant", content });
-      const results = await this.runTools(run, toolUses, root, s);
-      if (gen !== this.gen) return; // reset during tools: don't touch the new history
+      if (!withinBudget) {
+        // Close every tool_use without running it so the history stays valid.
+        const stub: ToolResult[] = toolUses.map((tu) => {
+          this.updateTool(tu.id, { status: "error", output: "Not run: team budget reached." });
+          return { type: "tool_result", tool_use_id: tu.id, content: "Not run: the team budget was reached.", is_error: true };
+        });
+        msgs.push({ role: "user", content: stub });
+        this.notice("info", "Team budget reached; this turn ended.");
+        return;
+      }
+      const results = await this.runTools(run, toolUses, s);
       msgs.push({ role: "user", content: results });
     }
   }
@@ -322,32 +468,48 @@ export class AgentSession {
   private async runTools(
     run: Run,
     toolUses: Anthropic.Beta.BetaToolUseBlock[],
-    root: string,
     s: Settings,
   ): Promise<ToolResult[]> {
-    const { gen, signal } = run;
+    const { signal } = run;
+    const root = this.team.root;
     const plans = toolUses.map((tu) => {
-      this.updateTool(tu.id, { input: tu.input }, gen);
+      this.updateTool(tu.id, { input: tu.input });
+      const teamTool = isTeamTool(tu.name);
       let input: unknown;
       let parseError: string | undefined;
-      try {
-        input = parseToolInput(tu.name, tu.input);
-      } catch (e) {
-        parseError = e instanceof ToolError ? e.message : String(e);
+      if (teamTool) {
+        input = tu.input; // validated by runTeamTool
+      } else {
+        try {
+          input = parseToolInput(tu.name, tu.input);
+        } catch (e) {
+          parseError = e instanceof ToolError ? e.message : String(e);
+        }
       }
-      const needsApproval = !parseError && !signal.aborted && (MUTATING.has(tu.name) || !s.autoApproveReads);
-      let approval: Promise<ApprovalResult> | undefined;
+      const needsApproval = !teamTool && !parseError && !signal.aborted && (MUTATING.has(tu.name) || !s.autoApproveReads);
+      let approval: Promise<{ approved: boolean; reason?: string }> | undefined;
       if (needsApproval) {
-        this.updateTool(tu.id, { status: "awaiting" }, gen);
-        approval = this.approvals.request(tu.id, { signal, coverable: tu.name === "edit_file" || tu.name === "write_file" });
+        this.updateTool(tu.id, { status: "awaiting" });
+        this.pendingApprovals++;
+        this.emitInfo();
+        approval = this.team.approvals
+          .request(
+            { id: tu.id, agent: this.name, tool: tu.name, input, coverable: tu.name === "edit_file" || tu.name === "write_file" },
+            signal,
+          )
+          .catch(() => ({ approved: false, reason: "stopped" }))
+          .finally(() => {
+            this.pendingApprovals = Math.max(0, this.pendingApprovals - 1);
+            this.emitInfo();
+          });
       }
-      return { tu, input, parseError, approval };
+      return { tu, input, parseError, approval, teamTool };
     });
 
     const results: ToolResult[] = [];
-    for (const { tu, input, parseError, approval } of plans) {
+    for (const { tu, input, parseError, approval, teamTool } of plans) {
       const fail = (text: string, status: "error" | "rejected" = "error"): ToolResult => {
-        this.updateTool(tu.id, { status, output: clip(text) }, gen);
+        this.updateTool(tu.id, { status, output: clip(text) });
         return { type: "tool_result", tool_use_id: tu.id, content: text, is_error: true };
       };
       if (parseError) {
@@ -360,8 +522,6 @@ export class AgentSession {
       }
       if (approval) {
         const decision = await approval;
-        // "Approve all" was just chosen: release the other waiting cards too.
-        if (this.approvals.approveAll) this.approvals.releaseCoverable();
         if (!decision.approved) {
           const why = decision.reason ? `: ${decision.reason}` : "";
           results.push(fail(`The user rejected this action${why}`, "rejected"));
@@ -372,20 +532,36 @@ export class AgentSession {
           continue;
         }
       }
-      this.updateTool(tu.id, { status: "running" }, gen);
+      this.updateTool(tu.id, { status: "running" });
       try {
-        const out = await runTool(tu.name, input, {
-          root,
-          signal,
-          commandTimeoutSec: s.commandTimeoutSec,
-          output: this.output,
-        });
-        this.updateTool(tu.id, { status: "done", output: clip(out) }, gen);
+        const out = teamTool
+          ? await runTeamTool(tu.name, input, { self: this.name, isLead: this.isLead, team: this.team })
+          : await this.runFileOrCommand(tu.name, input, root, signal, s);
+        this.updateTool(tu.id, { status: "done", output: clip(out) });
         results.push({ type: "tool_result", tool_use_id: tu.id, content: out });
       } catch (e) {
         results.push(fail(e instanceof Error ? e.message : String(e)));
       }
     }
     return results;
+  }
+
+  private runFileOrCommand(name: string, input: unknown, root: string, signal: AbortSignal, s: Settings): Promise<string> {
+    const exec = () =>
+      runTool(name, input, {
+        root,
+        signal,
+        commandTimeoutSec: s.commandTimeoutSec,
+        output: runtime!.output,
+      });
+    if (name !== "edit_file" && name !== "write_file") return exec();
+    // Serialise writes to the same file across agents.
+    let abs: string;
+    try {
+      abs = confinePath(root, (input as { path: string }).path);
+    } catch {
+      return exec(); // runTool reports the path error itself
+    }
+    return this.team.withFileLock(abs, exec, signal);
   }
 }

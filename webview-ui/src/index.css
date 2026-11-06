@@ -2,7 +2,8 @@
 
 /* shadcn tokens mapped onto VS Code theme variables so every theme works. */
 :root {
-  --background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  --background: var(--vscode-editor-background);
+  --sidebar: var(--vscode-sideBar-background, var(--vscode-editor-background));
   --foreground: var(--vscode-foreground);
   --card: var(--vscode-editor-background);
   --card-foreground: var(--vscode-editor-foreground, var(--vscode-foreground));
@@ -29,6 +30,7 @@
 
 @theme inline {
   --color-background: var(--background);
+  --color-sidebar: var(--sidebar);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
