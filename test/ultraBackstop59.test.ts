@@ -366,18 +366,18 @@ describe("10. >| redirect, r\\m unescaping, busybox", () => {
 });
 
 describe("known gaps (it.fails until fixed)", () => {
-  it.fails("posix unescapes a backslash inside a git subcommand word: git pu\\sh -f (GAP)", () => {
+  it("posix unescapes a backslash inside a git subcommand word: git pu\\sh -f", () => {
     ask("git pu\\sh -f");
     ask("git push --for\\ce");
   });
-  it.fails("cp --target-directory=<outside> asks like cp -t (GAP: long option with =)", () => {
+  it("cp --target-directory=<outside> asks like cp -t", () => {
     ask(`cp --target-directory=${OUT} a.ts`);
   });
-  it.fails("single-quoted $(...) is literal and allowed (GAP, over-ask)", () => {
+  it("single-quoted $(...) is literal and allowed", () => {
     ok("echo '$(rm -rf /)'");
     ok("git commit -m 'run $(rm -rf /) never'");
   });
-  it.fails("more credential dumps: gh auth status --show-token, git credential-store get, Get-Item Env:X (GAP)", () => {
+  it("more credential dumps: gh auth status --show-token, git credential-store get, Get-Item Env:X", () => {
     expect(["gh auth status --show-token", "git credential-store get", "Get-Item Env:SECRET"].map((c) => px(c) === "ask" || cm(c) === "ask")).toEqual([true, true, true]);
   });
 });

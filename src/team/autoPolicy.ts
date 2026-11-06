@@ -1191,6 +1191,36 @@ function expandBracesText(command: string): string | undefined {
  * The outer command keeps a `$SUB` placeholder, which counts as an expansion in any target position.
  */
 function peelSubstitutions(cmd: string): { outer: string; inner: string[] } | undefined {
+  // sh does not expand inside single quotes: hide those regions while peeling.
+  const hidden: string[] = [];
+  let masked = "";
+  for (let i = 0, dq = false; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (ch === "\\") {
+      masked += ch + (cmd[i + 1] ?? "");
+      i++;
+    } else if (ch === '"') {
+      dq = !dq;
+      masked += ch;
+    } else if (ch === "'" && !dq) {
+      const end = cmd.indexOf("'", i + 1);
+      if (end < 0) {
+        masked += cmd.slice(i);
+        break;
+      }
+      hidden.push(cmd.slice(i, end + 1));
+      masked += `\uE000${hidden.length - 1}\uE001`;
+      i = end;
+    } else {
+      masked += ch;
+    }
+  }
+  const restore = (s: string) => s.replace(/\uE000(\d+)\uE001/g, (_m, n: string) => hidden[Number(n)] ?? "");
+  const r = peelMasked(masked);
+  return r && { outer: restore(r.outer), inner: r.inner.map(restore) };
+}
+
+function peelMasked(cmd: string): { outer: string; inner: string[] } | undefined {
   const inner: string[] = [];
   let outer = cmd;
   for (let round = 0; round < 8; round++) {
@@ -1435,6 +1465,7 @@ function backstop(command: string, root: string, ctx: PolicyContext, depth: numb
       viaXargs = rawTokens.slice(0, rawTokens.length - unwrapped.length).some((x) => baseWord(x) === "xargs");
       tokens = unwrapped;
     }
+    if (posix && baseWord(tokens[0] ?? "") === "git") tokens = tokens.map(unescape); // git pu\sh -f
     const word = baseWord(tokens[0] ?? "");
     const args = tokens.slice(1);
     const lower = args.map((a) => a.toLowerCase());
@@ -1495,7 +1526,9 @@ function backstop(command: string, root: string, ctx: PolicyContext, depth: numb
       (word === "security" && /^find-(generic|internet)-password$/.test(lower[0] ?? "")) ||
       (word === "cmdkey" && lower.some((a) => a.startsWith("/list"))) ||
       word === "vaultcmd" ||
-      (word === "git" && gitParts(tokens).sub === "credential") ||
+      (word === "git" && gitParts(tokens).sub.startsWith("credential")) ||
+      (word === "gh" && lower[0] === "auth" && (lower.includes("--show-token") || lower.includes("-t"))) ||
+      (["get-item", "gi", "get-itemproperty", "gp", "get-itempropertyvalue", "gpv"].includes(word) && args.some((a) => /^(-path[:=])?env:/i.test(a) || /^\$?env:/i.test(a))) ||
       (word === "npm" && lower[0] === "token") ||
       word === "printenv" ||
       (word === "env" && args.length === 0) ||
@@ -1597,6 +1630,11 @@ function backstop(command: string, root: string, ctx: PolicyContext, depth: numb
       const ti = lower.findIndex((a) => a === "-t" || a === "--target-directory");
       if (ti >= 0 && args[ti + 1] !== undefined && (EXPANSION_IN_TARGET.test(args[ti + 1]) || outside(args[ti + 1]))) {
         return ultraAsk("target directory is outside the workspace");
+      }
+      const te = args.find((a) => /^--target-directory=/i.test(a));
+      if (te !== undefined) {
+        const dir = te.slice(te.indexOf("=") + 1);
+        if (EXPANSION_IN_TARGET.test(dir) || outside(dir)) return ultraAsk("target directory is outside the workspace");
       }
     }
 
