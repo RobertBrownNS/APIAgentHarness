@@ -105,7 +105,7 @@ export default function App() {
           approvals={approvals.length}
           solo={solo}
           agentNames={agents.map((a) => a.name)}
-          teamFull={teammateCount >= config.maxTeammates}
+          teamFull={config.maxTeammates > 0 && teammateCount >= config.maxTeammates}
         />
         {narrow && (!solo || tasks.length > 0) ? (
           <>

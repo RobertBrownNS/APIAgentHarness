@@ -45,13 +45,18 @@ export function Header({
           <span className="hidden text-[11px] text-muted-foreground sm:inline" title="Input + output tokens used by all agents">
             {fmt(totalTokens)} tok total
           </span>
-          {config.maxAutoTurns > 0 && !solo && (
+          {/* Budgets are optional (0 = no limit, the default); show a meter only for limits the user turned on. */}
+          {(config.maxAutoTurns > 0 || config.maxTeamOutputTokens > 0) && (
             <span
               className="hidden text-[11px] text-muted-foreground sm:inline"
-              title="Agent-to-agent turns left before agents pause, and team output tokens used. Both refill when you send a message."
+              title="Limits you set in NextAgent settings. Agents pause when one runs out; both refill when you send a message."
             >
-              auto-turns {config.autoTurnsLeft}/{config.maxAutoTurns}
-              {config.maxTeamOutputTokens > 0 && ` · ${fmt(config.teamOutputTokens)}/${fmt(config.maxTeamOutputTokens)} tok`}
+              {[
+                config.maxAutoTurns > 0 ? `auto-turns ${config.autoTurnsLeft}/${config.maxAutoTurns}` : "",
+                config.maxTeamOutputTokens > 0 ? `${fmt(config.teamOutputTokens)}/${fmt(config.maxTeamOutputTokens)} tok` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}
             </span>
           )}
           <Button variant="outline" size="sm" disabled={!anyBusy} onClick={() => post({ type: "stop" })} title="Stop every agent's current turn">

@@ -58,7 +58,7 @@ Automated checks (run first, all must pass): `npm run typecheck`, `npm test`, `n
 5. A docs edit needs approval. **It appears in the queue with a `docs` badge. Clicking the badge opens docs' chat. Approve it; docs continues.**
 6. With `docs` still unfinished, ask main: "stop docs". **docs goes grey (stopped), its unfinished tasks return to unassigned/pending, its pending approvals vanish.**
 7. Ask main to spawn a second teammate named `docs` (reused name) and ones named `lead`, `main`, `system` and `all` (all reserved). **Errors returned to main (duplicate / invalid / reserved); no crash.**
-8. Set `maxTeammates` to 1 and ask main to spawn two teammates. **The second is refused with a clear message to main.**
+8. (All limits are off by default: `maxTeammates`, `maxAutoTurns`, `maxTurnIterations` and `maxTeamOutputTokens` are 0 = no limit. With defaults, spawning many teammates, long agent-to-agent exchanges and long turns never pause or refuse. The next steps switch each limit on.) Set `maxTeammates` to 1 and ask main to spawn two teammates. **The second is refused with a clear message to main.**
 
 ## 7. User adds and removes a teammate
 1. Click "Add teammate"; try name `Bad Name`, `main`, a one-letter name. **The form blocks them; nothing is sent.**
@@ -197,7 +197,7 @@ Ultra approves every edit and command with NO safety check, except a short list 
 5. Edits: main edits `src/a.ts` and creates `new.txt`. **Run unasked.** Edits to `.env`, `id_rsa`, `key.pem` ask. Edits to `.git/hooks/pre-commit`, `.vscode/tasks.json`, `package.json` scripts: **record whether they ask** (spec: only secrets ask in Ultra).
 6. Leaving Ultra: in Ultra have main run two slow commands in one turn (`ping -n 5 127.0.0.1` twice) and switch to Normal (or Plan) during the first. **The second does not run unasked.** Switch Ultra -> Plan with an approval pending. **Plan refusal applies.** New team. **Mode returns to the default; the red banner and status bar colour clear.**
 7. Stop and Stop all work in Ultra: a long `ping -n 200 127.0.0.1` is killed by Stop; no leftover process.
-8. Budget and caps still apply in Ultra (auto-turn, iteration and team token limits). Run a long loop and confirm it still pauses.
+8. Limits you switch on still apply in Ultra (auto-turn, iteration and team token limits). Set one, run a long loop and confirm it pauses; with the defaults (0) nothing pauses.
 9. Teammates: spawn a teammate in Ultra. **It also runs commands unasked and obeys the same backstop** (try `rm -rf ../x` from the teammate).
 
 ## Known limits (not bugs)
@@ -209,4 +209,4 @@ Ultra approves every edit and command with NO safety check, except a short list 
 - Mail that arrives mid-turn is read at the end of that turn, not mid-turn.
 - Agents cannot message the user; their reply is in their own chat (unread badge).
 - An approved `write_file` can overwrite changes made by another agent after approval; `edit_file` fails safely.
-- Budgets protect against runaway spend but are not exact prices.
+- Budgets are off by default; when switched on they protect against runaway spend but are not exact prices.

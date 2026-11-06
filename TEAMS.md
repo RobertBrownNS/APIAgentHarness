@@ -272,6 +272,11 @@ CSS variables map onto our `--vscode-*` tokens):
   asking except a few catastrophic actions. Prefer reversible steps and say what you're about to do."
 - UI: Ultra in the mode switcher (red), confirm bar with the backstop list, persistent red banner; status bar error colour.
 
+## R5: limits are opt-in (user decision)
+The budget pause and caps were added by the manager, not requested by the user. All four limits (`maxTeammates`,
+`maxAutoTurns`, `maxTurnIterations`, `maxTeamOutputTokens`) now default to 0 = no limit; the spawn cap (3 × maxTeammates)
+only applies when maxTeammates is set. The header meter only shows for limits the user switched on.
+
 ## R3 file ownership
 Same owners as Round 2, plus: `src/team/autoPolicy.ts` → core; `src/agent/classifier.ts` → loop; `package.json` rename (whole
 file, incl. `name`/`displayName`) → panel; `src/agent/client.ts` key migration → panel.

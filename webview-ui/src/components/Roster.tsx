@@ -66,7 +66,7 @@ export function Roster({
   defaultModel: string;
   onSelect: (name: string) => void;
 }) {
-  const full = teammateCount >= maxTeammates;
+  const full = maxTeammates > 0 && teammateCount >= maxTeammates;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">

@@ -102,27 +102,27 @@
         },
         "nextAgent.maxTeammates": {
           "type": "number",
-          "default": 5,
+          "default": 0,
           "minimum": 0,
-          "description": "Maximum number of teammates (not counting main)."
+          "description": "Optional cap on the number of teammates (not counting main). 0 = no limit."
         },
         "nextAgent.maxAutoTurns": {
           "type": "number",
-          "default": 40,
-          "minimum": 1,
-          "description": "Maximum automatic (message-triggered) agent turns per team before agents pause; refilled whenever you send a message."
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional cap on automatic (message-triggered) agent turns before agents pause; refilled whenever you send a message. 0 = no limit."
         },
         "nextAgent.maxTurnIterations": {
           "type": "number",
-          "default": 40,
-          "minimum": 1,
-          "description": "Maximum model calls in a single agent turn before the turn ends with a notice."
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional cap on model calls in a single agent turn. 0 = no limit."
         },
         "nextAgent.maxTeamOutputTokens": {
           "type": "number",
-          "default": 1500000,
-          "minimum": 1000,
-          "description": "Team-wide budget in output-equivalent tokens (output tokens plus input and cache tokens, weighted by price). When it is used up, all agents pause. It refills when you send a message."
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional team-wide budget in output-equivalent tokens (input and cache tokens weighted by price). Agents pause when it is used up; it refills when you send a message. 0 = no limit."
         },
         "nextAgent.defaultMode": {
           "type": "string",

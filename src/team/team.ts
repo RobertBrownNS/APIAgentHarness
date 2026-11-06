@@ -154,6 +154,8 @@ export class Team implements TeamContext {
   }
 
   takeAutoTurn(_agent: string): boolean {
+    // All limits are optional: 0 (the default) means unlimited.
+    if (!(this.opts.settings().maxAutoTurns > 0)) return true;
     if (this.autoTurnsLeft <= 0) return false;
     this.autoTurnsLeft--;
     this.scheduleConfig();
@@ -161,7 +163,8 @@ export class Team implements TeamContext {
   }
 
   allowModelCall(_agent: string): boolean {
-    return !this.disposed && this.teamOutputTokens < this.opts.settings().maxTeamOutputTokens;
+    const max = this.opts.settings().maxTeamOutputTokens;
+    return !this.disposed && (!(max > 0) || this.teamOutputTokens < max);
   }
 
   recordUsage(
@@ -175,7 +178,8 @@ export class Team implements TeamContext {
       n(usage.output) + 0.2 * (n(usage.uncachedInput) + 1.25 * n(usage.cacheWrite)) + 0.01 * n(usage.cacheRead),
     );
     this.scheduleConfig();
-    if (this.teamOutputTokens < this.opts.settings().maxTeamOutputTokens) return true;
+    const max = this.opts.settings().maxTeamOutputTokens;
+    if (!(max > 0) || this.teamOutputTokens < max) return true;
     if (!this.budgetHit) {
       this.budgetHit = true;
       for (const s of this.slots.values()) {
@@ -201,7 +205,7 @@ export class Team implements TeamContext {
     if (this.slots.has(name)) throw new TeamError(`An agent named "${name}" already exists.`);
     const s = this.opts.settings();
     const active = this.roster().filter((r) => !r.isLead && r.status !== "stopped");
-    if (active.length >= s.maxTeammates) {
+    if (s.maxTeammates > 0 && active.length >= s.maxTeammates) {
       throw new TeamError(`The team already has the maximum of ${s.maxTeammates} teammates. Stop one first.`);
     }
     const role = (input.role ?? "").trim();
@@ -212,7 +216,7 @@ export class Team implements TeamContext {
     if (input.effort !== undefined && !EFFORTS.includes(input.effort)) {
       throw new TeamError(`Unknown effort "${String(input.effort)}". Choose one of: ${EFFORTS.join(", ")}.`);
     }
-    if (this.spawnCount >= s.maxTeammates * 3) {
+    if (s.maxTeammates > 0 && this.spawnCount >= s.maxTeammates * 3) {
       throw new TeamError(`This team has already spawned ${this.spawnCount} teammates; start a new team instead of respawning.`);
     }
     // The first turn counts against the auto-turn budget, so spawn/stop cycles can't run unbounded.

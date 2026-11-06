@@ -317,8 +317,9 @@ export class AgentSession implements AgentHandle {
     const tools = [...toolDefinitions, ...teamToolDefinitions(this.isLead)];
     let retries = 0;
 
-    const cfgMax = cfgGet<number>("maxTurnIterations", 40);
-    const maxIter = Number.isFinite(cfgMax) && cfgMax > 0 ? cfgMax : 40;
+    // 0 (the default) means no limit on model calls per turn.
+    const cfgMax = cfgGet<number>("maxTurnIterations", 0);
+    const maxIter = Number.isFinite(cfgMax) && cfgMax > 0 ? cfgMax : Infinity;
     let iter = 0;
     while (!signal.aborted) {
       if (iter++ >= maxIter) {

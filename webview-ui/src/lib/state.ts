@@ -21,7 +21,7 @@ export const initialState: State = {
   tasks: [],
   approvals: [],
   config: { model: "", effort: "medium", teammateModel: "", hasCredentials: true,
-    maxTeammates: 5,
+    maxTeammates: 0,
     mode: "normal",
     contextWindow: 1_000_000,
     autoTurnsLeft: 0,
