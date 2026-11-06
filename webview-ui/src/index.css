@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* Tailwind's `dark:` must follow the VS Code theme (body classes), not the OS colour scheme. */
+@custom-variant dark (&:where(body.vscode-dark *, body.vscode-high-contrast:not(.vscode-high-contrast-light) *));
+
 /* shadcn tokens mapped onto VS Code theme variables so every theme works. */
 :root {
   --background: var(--vscode-editor-background);
