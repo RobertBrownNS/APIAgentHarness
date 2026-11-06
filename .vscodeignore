@@ -12,3 +12,4 @@ TASKS.md
 QA.md
 vitest.config.ts
 TEAMS.md
+.github/**
