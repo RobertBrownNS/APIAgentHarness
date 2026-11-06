@@ -1,0 +1,13 @@
+src/**
+test/**
+webview-ui/**
+!webview-ui/dist/**
+node_modules/**
+**/*.map
+esbuild.mjs
+tsconfig.json
+.vscode/**
+.gitignore
+TASKS.md
+QA.md
+vitest.config.ts

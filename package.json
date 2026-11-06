@@ -1,0 +1,134 @@
+{
+  "name": "agent-harness-vscode",
+  "displayName": "Agent Harness",
+  "description": "A Claude-powered coding agent with its own tool loop, in a VS Code side panel.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentHarness",
+          "title": "Agent Harness",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentHarness": [
+        {
+          "type": "webview",
+          "id": "agentHarness.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentHarness.setApiKey",
+        "title": "Set API Key",
+        "category": "Agent Harness"
+      },
+      {
+        "command": "agentHarness.clearApiKey",
+        "title": "Clear API Key",
+        "category": "Agent Harness"
+      },
+      {
+        "command": "agentHarness.newChat",
+        "title": "New Chat",
+        "category": "Agent Harness",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentHarness.stop",
+        "title": "Stop",
+        "category": "Agent Harness",
+        "icon": "$(debug-stop)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentHarness.newChat",
+          "when": "view == agentHarness.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Harness",
+      "properties": {
+        "agentHarness.model": {
+          "type": "string",
+          "default": "claude-opus-5-5",
+          "description": "Claude model ID used by the agent."
+        },
+        "agentHarness.effort": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "high",
+          "description": "How much effort (thinking depth and token spend) the model puts into each turn."
+        },
+        "agentHarness.maxTokens": {
+          "type": "number",
+          "default": 64000,
+          "description": "Maximum output tokens per model response."
+        },
+        "agentHarness.autoApproveReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run read-only tools (read, list, search) without asking."
+        },
+        "agentHarness.commandTimeoutSec": {
+          "type": "number",
+          "default": 120,
+          "description": "Kill terminal commands that run longer than this many seconds."
+        },
+        "agentHarness.refusalFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "If the model declines a request, let the API retry it on a fallback model automatically."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:ext && npm run build:webview",
+    "build:ext": "node esbuild.mjs",
+    "build:webview": "npm --prefix webview-ui run build",
+    "watch:ext": "node esbuild.mjs --watch",
+    "watch:webview": "npm --prefix webview-ui run watch",
+    "typecheck": "tsc --noEmit && npm --prefix webview-ui run typecheck",
+    "test": "vitest run",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
