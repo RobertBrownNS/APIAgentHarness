@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { SECRET_KEY } from "./agent/client";
+import { listLocalModels, LOCAL_SECRET_KEY, localServerUrl } from "./agent/local";
 import { configureAgentRuntime } from "./agent/loop";
 import { ChatPanel } from "./ChatPanel";
 import { MODES, type Mode } from "./shared/protocol";
@@ -108,6 +109,36 @@ export function activate(context: vscode.ExtensionContext): void {
       await context.secrets.delete(SECRET_KEY);
       await ChatPanel.active?.postConfig();
       void vscode.window.showInformationMessage("NextAgent: API key cleared.");
+    }),
+    vscode.commands.registerCommand("nextAgent.setLocalApiKey", async () => {
+      const key = await vscode.window.showInputBox({
+        title: "Unsloth Desktop API key",
+        prompt: `Create one in Unsloth (Settings → API). Server: ${localServerUrl()}. Stored in VS Code's secret storage.`,
+        placeHolder: "sk-unsloth-…",
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (!key?.trim()) return;
+      await context.secrets.store(LOCAL_SECRET_KEY, key.trim());
+      await ChatPanel.active?.postConfig();
+      const models = await listLocalModels(context.secrets);
+      void vscode.window.showInformationMessage(
+        models.length
+          ? `NextAgent: Unsloth key saved. ${models.length} local model${models.length === 1 ? "" : "s"} found.`
+          : `NextAgent: Unsloth key saved, but no models were found at ${localServerUrl()}. Is Unsloth Desktop running?`,
+      );
+    }),
+    vscode.commands.registerCommand("nextAgent.clearLocalApiKey", async () => {
+      await context.secrets.delete(LOCAL_SECRET_KEY);
+      await ChatPanel.active?.postConfig();
+      void vscode.window.showInformationMessage("NextAgent: Unsloth key cleared.");
+    }),
+    vscode.commands.registerCommand("nextAgent.refreshLocalModels", async () => {
+      await ChatPanel.active?.postConfig();
+      const models = await listLocalModels(context.secrets);
+      void vscode.window.showInformationMessage(
+        models.length ? `NextAgent: ${models.length} local model${models.length === 1 ? "" : "s"} available.` : `NextAgent: no local models found at ${localServerUrl()}.`,
+      );
     }),
   );
 }

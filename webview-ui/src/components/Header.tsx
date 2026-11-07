@@ -87,6 +87,7 @@ export function Header({
           existing={agentNames}
           disabled={teamFull}
           defaultModel={config.teammateModel || config.model}
+          localModels={config.localModels}
           open={adding}
           onOpenChange={setAdding}
           hideTrigger

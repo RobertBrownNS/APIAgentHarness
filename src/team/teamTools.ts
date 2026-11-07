@@ -326,10 +326,12 @@ export async function runTeamTool(name: string, input: unknown, ctx: TeamToolCon
     }
     case "team_roster": {
       parse("team_roster", input);
-      return team
+      const rows = team
         .roster()
         .map((r) => `${r.name}${r.isLead ? " (main)" : ""} | ${r.role || "-"} | ${r.model} | ${r.status}`)
         .join("\n");
+      const models = team.availableModels?.() ?? [];
+      return models.length ? `${rows}\n\nModels for spawn_teammate: ${models.join(", ")}` : rows;
     }
   }
 }

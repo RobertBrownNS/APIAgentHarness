@@ -84,6 +84,7 @@ export default function App() {
       teammateCount={teammateCount}
       maxTeammates={config.maxTeammates}
       defaultModel={config.teammateModel || config.model}
+      localModels={config.localModels}
       onSelect={select}
     />
   );

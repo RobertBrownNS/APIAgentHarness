@@ -7,7 +7,7 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, Dia
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { EffortSelect, modelOptions } from "@/components/ModelEffortSelects";
+import { EffortSelect, modelLabel, modelOptions } from "@/components/ModelEffortSelects";
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,23}$/;
 const RESERVED: string[] = [LEAD, ...RESERVED_NAMES];
@@ -28,6 +28,7 @@ export function AddTeammateDialog({
   open: openProp,
   onOpenChange,
   hideTrigger = false,
+  localModels = [],
 }: {
   existing: string[];
   disabled: boolean;
@@ -36,6 +37,7 @@ export function AddTeammateDialog({
   open?: boolean;
   onOpenChange?: (o: boolean) => void;
   hideTrigger?: boolean;
+  localModels?: readonly string[];
 }) {
   const [openState, setOpenState] = useState(false);
   const open = openProp ?? openState;
@@ -125,9 +127,9 @@ export function AddTeammateDialog({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={DEFAULT_MODEL}>Default{defaultModel ? ` (${defaultModel})` : ""}</SelectItem>
-                  {modelOptions().map((m) => (
+                  {modelOptions(undefined, localModels).map((m) => (
                     <SelectItem key={m} value={m}>
-                      {m}
+                      {modelLabel(m)}
                     </SelectItem>
                   ))}
                 </SelectContent>

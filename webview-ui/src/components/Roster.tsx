@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { modelLabel } from "@/components/ModelEffortSelects";
 import { MoreHorizontal, Play, Square, Trash2 } from "lucide-react";
 import type { AgentInfo } from "@shared/protocol";
 import { post } from "@/vscode";
@@ -56,6 +57,7 @@ export function Roster({
   teammateCount,
   maxTeammates,
   defaultModel,
+  localModels,
   onSelect,
 }: {
   agents: AgentInfo[];
@@ -64,6 +66,7 @@ export function Roster({
   teammateCount: number;
   maxTeammates: number;
   defaultModel: string;
+  localModels?: readonly string[];
   onSelect: (name: string) => void;
 }) {
   const full = maxTeammates > 0 && teammateCount >= maxTeammates;
@@ -116,7 +119,7 @@ export function Roster({
                 )}
                 <div className="flex items-center gap-1 pl-4 text-[10px] text-muted-foreground">
                   <span className="min-w-0 truncate" title={a.model}>
-                    {a.model}
+                    {modelLabel(a.model)}
                   </span>
                   <span className="shrink-0" title="input / output tokens">· {fmtTokens(a.inputTokens)} in / {fmtTokens(a.outputTokens)} out</span>
                 </div>
@@ -131,6 +134,7 @@ export function Roster({
           disabled={full}
           disabledReason={full ? `Team is full (${maxTeammates} teammates)` : undefined}
           defaultModel={defaultModel}
+          localModels={localModels}
         />
       </div>
     </div>

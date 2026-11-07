@@ -1,10 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const create = vi.fn();
+const localCreate = vi.fn();
 const withOptions = vi.fn();
 let clientAvailable = true;
+let claudeCreds = true;
+const createClientModel = vi.fn();
 vi.mock("../src/agent/client", () => ({
-  createClient: async () => (clientAvailable ? { withOptions } : undefined),
+  createClient: async (_s: unknown, model?: string) => {
+    createClientModel(model);
+    return clientAvailable ? { withOptions } : undefined;
+  },
+  hasClaudeCredentials: async () => claudeCreds,
 }));
 
 import { createCommandClassifier, DEFAULT_SAFETY_MODEL } from "../src/agent/classifier";
@@ -22,9 +29,52 @@ const text = (t: string) => reply({ content: [{ type: "text", text: t }] });
 
 beforeEach(() => {
   create.mockReset();
+  localCreate.mockReset();
+  createClientModel.mockReset();
   withOptions.mockReset();
-  withOptions.mockReturnValue({ beta: { messages: { create } } });
+  withOptions.mockReturnValue({ beta: { messages: { create } }, messages: { create: localCreate } });
   clientAvailable = true;
+  claudeCreds = true;
+});
+
+describe("local model fallback (no Claude key)", () => {
+  it("uses the local model with a plain request when no Claude key is set", async () => {
+    claudeCreds = false;
+    localCreate.mockResolvedValue(reply());
+    const r = await createCommandClassifier(secrets, undefined, () => "local:qwen-local")(check, sig());
+    expect(create).not.toHaveBeenCalled();
+    expect(createClientModel).toHaveBeenCalledWith("local:qwen-local");
+    const [body] = localCreate.mock.calls[0];
+    expect(body.model).toBe("qwen-local");
+    expect(body.output_config).toBeUndefined();
+    expect(body.thinking).toBeUndefined();
+    expect(body.enable_tools).toBe(false);
+    expect(r.verdict).toBe("allow");
+  });
+  it("reads a JSON verdict wrapped in prose or a code fence", async () => {
+    claudeCreds = false;
+    localCreate.mockResolvedValue(text('Sure!\n```json\n{"verdict": "allow", "reason": "runs tests"}\n```'));
+    const r = await createCommandClassifier(secrets, undefined, () => "local:m")(check, sig());
+    expect(r.verdict).toBe("allow");
+  });
+  it("asks when the local answer has no readable verdict", async () => {
+    claudeCreds = false;
+    localCreate.mockResolvedValue(text("I think it's probably fine."));
+    const r = await createCommandClassifier(secrets, undefined, () => "local:m")(check, sig());
+    expect(r.verdict).toBe("ask");
+  });
+  it("asks when there is neither a Claude key nor a local model", async () => {
+    claudeCreds = false;
+    const r = await createCommandClassifier(secrets, undefined, () => undefined)(check, sig());
+    expect(r.verdict).toBe("ask");
+    expect(localCreate).not.toHaveBeenCalled();
+  });
+  it("prefers Haiku whenever a Claude key is set", async () => {
+    create.mockResolvedValue(reply());
+    await createCommandClassifier(secrets, undefined, () => "local:m")(check, sig());
+    expect(create).toHaveBeenCalled();
+    expect(localCreate).not.toHaveBeenCalled();
+  });
 });
 
 describe("request shape", () => {

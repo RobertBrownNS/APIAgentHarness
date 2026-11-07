@@ -12,6 +12,17 @@ export const MODELS = [
   "claude-fable-5-1",
 ] as const;
 
+/**
+ * Local models served by Unsloth Desktop (its Anthropic-compatible /v1/messages API) are named "local:<model id>",
+ * so an agent's model string says which server to use. Any agent can use a Claude or a local model.
+ */
+export const LOCAL_PREFIX = "local:";
+export const isLocalModel = (model: string): boolean => model.startsWith(LOCAL_PREFIX);
+export const localModelId = (model: string): string => (isLocalModel(model) ? model.slice(LOCAL_PREFIX.length) : model);
+/** Claude model ids or "local:<id>". */
+export const isKnownModel = (model: string): boolean =>
+  (MODELS as readonly string[]).includes(model) || (isLocalModel(model) && localModelId(model).trim().length > 0);
+
 /** The main (lead) agent always has this name. */
 export const LEAD = "main";
 /** Names teammates may not use. */
@@ -145,6 +156,11 @@ export interface SessionConfig {
   maxTeammates: number;
   /** Team-wide permission mode. */
   mode: Mode;
+  /** Models available from Unsloth Desktop, as "local:<id>" (loaded ones first). Empty when it isn't reachable. */
+  localModels?: string[];
+  /** Unsloth Desktop base URL, and whether its API key is saved. */
+  localServer?: string;
+  hasLocalKey?: boolean;
   /** Context window of the model, for the context meter (1_000_000 for current models). */
   contextWindow: number;
   /** Team budgets. Both refill whenever the user sends a message. Re-sent (throttled) when they change. */

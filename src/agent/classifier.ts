@@ -1,11 +1,22 @@
+import type Anthropic from "@anthropic-ai/sdk";
 import { randomBytes } from "node:crypto";
 import type * as vscode from "vscode";
 import { z } from "zod";
-import { createClient } from "./client";
+import { createClient, hasClaudeCredentials } from "./client";
 import type { CommandClassifier } from "../team/types";
+import { localModelId } from "../shared/protocol";
 
 export const DEFAULT_SAFETY_MODEL = "claude-haiku-5-5";
 const TIMEOUT_MS = 10_000;
+/** Local models on consumer hardware are slower than Haiku. */
+const LOCAL_TIMEOUT_MS = 30_000;
+
+/** The first {...} span in a local model's reply (they often wrap JSON in prose or code fences). */
+export function firstJsonObject(text: string): string {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  return start >= 0 && end > start ? text.slice(start, end + 1) : text;
+}
 const MAX_COMMAND = 4000;
 
 const SYSTEM = `You are a safety reviewer for NextAgent, a VS Code extension in which an autonomous coding agent runs shell commands inside the user's project.
@@ -36,11 +47,17 @@ const Verdict = z.object({ verdict: z.enum(["allow", "ask"]), reason: z.string()
 export function createCommandClassifier(
   secrets: vscode.SecretStorage,
   getModel: () => string = () => DEFAULT_SAFETY_MODEL,
+  /** A "local:<id>" model to use when no Claude key is set (Unsloth Desktop), or undefined. */
+  getLocalModel: () => string | undefined = () => undefined,
 ): CommandClassifier {
   return async (check, signal) => {
     const ask = (why: string) => ({ verdict: "ask" as const, reason: `safety check unavailable: ${why}` });
     try {
-      const base = await createClient(secrets);
+      // Haiku when a Claude key is set; otherwise the local model (offline). Unclear answers ask either way.
+      const useClaude = await hasClaudeCredentials(secrets);
+      const localModel = useClaude ? undefined : getLocalModel();
+      if (!useClaude && !localModel) return ask("no Claude key and no local model available");
+      const base = await createClient(secrets, localModel);
       if (!base) return ask("no API credentials");
       const client = base.withOptions({ maxRetries: 1 });
       const command = check.command.slice(0, MAX_COMMAND);
@@ -62,17 +79,30 @@ ${check.scriptBody.slice(0, MAX_COMMAND)}
 `
           : "") +
         "Judge the command above.";
-      const msg = await client.beta.messages.create(
-        {
-          model: getModel() || DEFAULT_SAFETY_MODEL,
-          max_tokens: 1024,
-          thinking: { type: "disabled" }, // otherwise adaptive thinking can eat the whole budget and leave no verdict
-          system: SYSTEM,
-          messages: [{ role: "user", content: user }],
-          output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
-        },
-        { signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]) },
-      );
+      const opts = { signal: AbortSignal.any([signal, AbortSignal.timeout(localModel ? LOCAL_TIMEOUT_MS : TIMEOUT_MS)]) };
+      const msg: Anthropic.Beta.BetaMessage = localModel
+        ? // Local models: no structured outputs or thinking controls, so ask for JSON and parse it leniently below.
+          ((await client.messages.create(
+            {
+              model: localModelId(localModel),
+              max_tokens: 1024,
+              system: `${SYSTEM}\nOutput only the JSON object, nothing else.`,
+              messages: [{ role: "user", content: user }],
+              enable_tools: false,
+            } as unknown as Parameters<typeof client.messages.create>[0],
+            opts,
+          )) as unknown as Anthropic.Beta.BetaMessage)
+        : ((await client.beta.messages.create(
+            {
+              model: getModel() || DEFAULT_SAFETY_MODEL,
+              max_tokens: 1024,
+              thinking: { type: "disabled" }, // otherwise adaptive thinking can eat the whole budget and leave no verdict
+              system: SYSTEM,
+              messages: [{ role: "user", content: user }],
+              output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
+            },
+            opts,
+          )) as Anthropic.Beta.BetaMessage);
       const u = msg.usage;
       const cacheRead = u.cache_read_input_tokens ?? 0;
       const cacheWrite = u.cache_creation_input_tokens ?? 0;
@@ -91,7 +121,7 @@ ${check.scriptBody.slice(0, MAX_COMMAND)}
         .join("");
       let parsed: z.infer<typeof Verdict>;
       try {
-        parsed = Verdict.parse(JSON.parse(text));
+        parsed = Verdict.parse(JSON.parse(localModel ? firstJsonObject(text) : text));
       } catch {
         return { ...ask("unreadable verdict"), usage };
       }

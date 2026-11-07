@@ -157,6 +157,7 @@ export function Composer({ agent, config }: { agent: AgentInfo; config: SessionC
           <ModelSelect
             className="w-36"
             value={agent.model}
+            localModels={config.localModels}
             disabled={stopped}
             onChange={(model) => post({ type: "setAgentModel", agent: name, model })}
           />

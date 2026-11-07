@@ -3,8 +3,9 @@ import * as fs from "node:fs";
 import * as vscode from "vscode";
 import { z } from "zod";
 import { hasCredentials } from "./agent/client";
+import { listLocalModels, localKey, localServerUrl } from "./agent/local";
 import type { Effort, HostMessage, WebviewMessage } from "./shared/protocol";
-import { EFFORTS, MODES } from "./shared/protocol";
+import { EFFORTS, isLocalModel, LOCAL_PREFIX, MODES } from "./shared/protocol";
 import { createCommandClassifier } from "./agent/classifier";
 import type { Mode } from "./shared/protocol";
 import { AgentSession } from "./agent/loop";
@@ -178,8 +179,14 @@ export class ChatPanel {
         if (seq === this.teamSeq) this.post(m);
       },
       createAgent: (o) => new AgentSession(o),
-      classify: createCommandClassifier(this.context.secrets, () =>
-        vscode.workspace.getConfiguration("nextAgent").get<string>("autoSafetyModel", "claude-haiku-5-5"),
+      classify: createCommandClassifier(
+        this.context.secrets,
+        () => vscode.workspace.getConfiguration("nextAgent").get<string>("autoSafetyModel", "claude-haiku-5-5"),
+        // Without a Claude key, the safety check asks a local model: the configured one, else the first loaded one.
+        () => {
+          const chosen = vscode.workspace.getConfiguration("nextAgent").get<string>("local.safetyModel", "").trim();
+          return chosen ? (isLocalModel(chosen) ? chosen : `${LOCAL_PREFIX}${chosen}`) : this.localModels[0];
+        },
       ),
       log: (line) => this.output.appendLine(line),
     });
@@ -196,6 +203,9 @@ export class ChatPanel {
       maxTurnIterations: cfg.get<number>("maxTurnIterations", 0),
       maxTeamOutputTokens: cfg.get<number>("maxTeamOutputTokens", 0),
       hasCredentials: this.creds,
+      localModels: this.localModels,
+      localServer: localServerUrl(),
+      hasLocalKey: this.hasLocalKey,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
       autoSafetyCheck: cfg.get<boolean>("autoSafetyCheck", true),
       contextWindow: 1_000_000,
@@ -203,9 +213,19 @@ export class ChatPanel {
     };
   }
 
-  /** Re-check credentials and push the config (after settings or API key changes). */
+  /** Unsloth Desktop models ("local:<id>") and whether its key is saved; refreshed with the config. */
+  private localModels: string[] = [];
+  private hasLocalKey = false;
+
+  private async refreshLocal(): Promise<void> {
+    this.hasLocalKey = Boolean(await localKey(this.context.secrets));
+    this.localModels = this.hasLocalKey ? await listLocalModels(this.context.secrets) : [];
+  }
+
+  /** Re-check credentials and local models, then push the config (after settings or API key changes). */
   async postConfig(): Promise<void> {
     this.creds = await hasCredentials(this.context.secrets);
+    await this.refreshLocal();
     if (this.disposed) return;
     this.team.refreshConfig();
   }
@@ -214,6 +234,10 @@ export class ChatPanel {
     this.creds = await hasCredentials(this.context.secrets);
     if (this.disposed) return;
     this.post(this.team.snapshot());
+    // The local model list can take a moment (Unsloth may be starting); push it when it arrives.
+    void this.refreshLocal().then(() => {
+      if (!this.disposed) this.team.refreshConfig();
+    });
   }
 
   private confirmingNewTeam = false;

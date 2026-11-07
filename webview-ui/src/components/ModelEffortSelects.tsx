@@ -1,10 +1,16 @@
-import { EFFORTS, MODELS, type Effort } from "@shared/protocol";
+import { EFFORTS, isLocalModel, localModelId, MODELS, type Effort } from "@shared/protocol";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-export function modelOptions(current?: string): string[] {
-  const models: string[] = [...MODELS];
+/** Claude models, then local Unsloth models ("local:<id>"). */
+export function modelOptions(current?: string, localModels: readonly string[] = []): string[] {
+  const models: string[] = [...MODELS, ...localModels];
   if (current && !models.includes(current)) models.unshift(current);
   return models;
+}
+
+/** How a model reads in the UI: local ones show their Unsloth id with a "local" tag. */
+export function modelLabel(model: string): string {
+  return isLocalModel(model) ? `${localModelId(model)} · local` : model;
 }
 
 export function ModelSelect({
@@ -12,11 +18,13 @@ export function ModelSelect({
   onChange,
   disabled,
   className,
+  localModels,
 }: {
   value: string;
   onChange: (v: string) => void;
   disabled?: boolean;
   className?: string;
+  localModels?: readonly string[];
 }) {
   return (
     <Select value={value || undefined} onValueChange={onChange} disabled={disabled}>
@@ -24,9 +32,9 @@ export function ModelSelect({
         <SelectValue placeholder="Model" />
       </SelectTrigger>
       <SelectContent>
-        {modelOptions(value).map((m) => (
+        {modelOptions(value, localModels).map((m) => (
           <SelectItem key={m} value={m}>
-            {m}
+            {modelLabel(m)}
           </SelectItem>
         ))}
       </SelectContent>

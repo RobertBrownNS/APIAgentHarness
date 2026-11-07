@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
+import type { BetaMessageStream } from "@anthropic-ai/sdk/lib/BetaMessageStream";
 import * as vscode from "vscode";
-import type { AgentInfo, AgentStatus, ChatItem, Effort, Mode } from "../shared/protocol";
+import { isLocalModel, localModelId, type AgentInfo, type AgentStatus, type ChatItem, type Effort, type Mode } from "../shared/protocol";
 import type { AgentEvents, AgentHandle, AgentOptions, Authorization, TeamContext } from "../team/types";
 import { isTeamTool, runTeamTool, teamToolDefinitions } from "../team/teamTools";
 import { appendUserTurn, systemNotesToText } from "./history";
@@ -85,6 +86,10 @@ export class AgentSession implements AgentHandle {
   private inputTokens = 0;
   private contextTokens = 0;
   private notesAsText = false;
+  /** Mode notes go as text for local models (Unsloth's API doesn't document role: "system" messages) or after a 400. */
+  private notesTextMode(): boolean {
+    return this.notesAsText || isLocalModel(this.model);
+  }
   private turnErrored = false;
   private errorText = "";
   private lastText = "";
@@ -250,15 +255,20 @@ export class AgentSession implements AgentHandle {
         this.notice("error", "Agent runtime is not configured.");
         return this.result(abort);
       }
-      const base = await createClient(runtime.secrets);
+      const base = await createClient(runtime.secrets, this.model);
       const client = base?.withOptions({ maxRetries: 5 }); // parallel agents hit 429/529 more often
       if (!client) {
-        this.notice("error", "No API key found. Run 'NextAgent: Set API Key'.");
+        this.notice(
+          "error",
+          isLocalModel(this.model)
+            ? "No Unsloth API key found. Create one in Unsloth (Settings → API), then run 'NextAgent: Set Local Model Key'."
+            : "No API key found. Run 'NextAgent: Set API Key'.",
+        );
         return this.result(abort);
       }
       if (abort.signal.aborted) return this.result(abort);
 
-      appendUserTurn(msgs, text, this.drainNotes(), this.notesAsText); // merges into a trailing user message after Stop or an API error
+      appendUserTurn(msgs, text, this.drainNotes(), this.notesTextMode()); // merges into a trailing user message after Stop or an API error
 
       const settings: Settings = {
         maxTokens: cfgGet<number>("maxTokens", 64000),
@@ -295,6 +305,20 @@ export class AgentSession implements AgentHandle {
   private reportError(err: unknown, signal: AbortSignal): void {
     if (err instanceof Anthropic.APIUserAbortError || signal.aborted) return;
     this.log(`[error] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+    if (isLocalModel(this.model)) {
+      if (err instanceof Anthropic.APIConnectionError) {
+        this.notice("error", "Can't reach Unsloth Desktop. Is it running with a model loaded? (Check nextAgent.local.baseUrl.)");
+        return;
+      }
+      if (err instanceof Anthropic.AuthenticationError) {
+        this.notice("error", "Unsloth rejected the API key. Create a new one in Unsloth (Settings → API) and run 'NextAgent: Set Local Model Key'.");
+        return;
+      }
+      if (err instanceof Anthropic.NotFoundError) {
+        this.notice("error", `Unsloth doesn't know the model "${localModelId(this.model)}", or its API isn't enabled. Load the model in Unsloth and pick it again.`);
+        return;
+      }
+    }
     if (err instanceof Anthropic.AuthenticationError) {
       this.notice("error", "Invalid API key. Run 'NextAgent: Set API Key'.");
     } else if (err instanceof Anthropic.RateLimitError) {
@@ -338,18 +362,40 @@ export class AgentSession implements AgentHandle {
         return;
       }
       // model/effort are read per iteration so a change in the UI applies to the next request
-      const params: Parameters<typeof client.beta.messages.stream>[0] = {
-        model: this.model,
-        max_tokens: s.maxTokens,
-        system,
-        tools,
-        messages: msgs,
-        thinking: { type: "adaptive", display: "summarized" },
-        output_config: { effort: this.effort },
-        cache_control: { type: "ephemeral" },
-        ...(s.refusalFallback ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
-      };
-      const stream = client.beta.messages.stream(params, { signal });
+      let stream: BetaMessageStream;
+      if (isLocalModel(this.model)) {
+        // Unsloth Desktop's Anthropic-compatible API: plain Messages request, no Claude-only fields (thinking, effort,
+        // caching, fallback, eager tool streaming). enable_tools: false keeps Unsloth's own server-side tools from
+        // swallowing the agent's tool calls.
+        const localTools = tools.map((t) => {
+          const { eager_input_streaming: _eager, ...rest } = t as Anthropic.Beta.BetaTool;
+          return rest;
+        });
+        const body = {
+          model: localModelId(this.model),
+          max_tokens: cfgGet<number>("local.maxTokens", 8192),
+          system,
+          tools: localTools,
+          messages: msgs,
+          enable_tools: false,
+        };
+        stream = client.messages.stream(body as unknown as Parameters<typeof client.messages.stream>[0], {
+          signal,
+        }) as unknown as BetaMessageStream;
+      } else {
+        const params: Parameters<typeof client.beta.messages.stream>[0] = {
+          model: this.model,
+          max_tokens: s.maxTokens,
+          system,
+          tools,
+          messages: msgs,
+          thinking: { type: "adaptive", display: "summarized" },
+          output_config: { effort: this.effort },
+          cache_control: { type: "ephemeral" },
+          ...(s.refusalFallback ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
+        };
+        stream = client.beta.messages.stream(params, { signal });
+      }
 
       stream.on("streamEvent", (ev) => {
         if (ev.type === "content_block_start") {
@@ -485,12 +531,12 @@ export class AgentSession implements AgentHandle {
           this.updateTool(tu.id, { status: "error", output: "Not run: team budget reached." });
           return { type: "tool_result", tool_use_id: tu.id, content: "Not run: the team budget was reached.", is_error: true };
         });
-        appendUserTurn(msgs, stub, this.drainNotes(), this.notesAsText);
+        appendUserTurn(msgs, stub, this.drainNotes(), this.notesTextMode());
         this.notice("info", "Team budget reached; this turn ended.");
         return;
       }
       const results = await this.runTools(run, toolUses, s);
-      appendUserTurn(msgs, results, this.drainNotes(), this.notesAsText);
+      appendUserTurn(msgs, results, this.drainNotes(), this.notesTextMode());
     }
   }
 

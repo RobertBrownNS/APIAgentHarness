@@ -2,6 +2,7 @@ import {
   EFFORTS,
   LEAD,
   MODELS,
+  isKnownModel,
   RESERVED_NAMES,
   type AgentInfo,
   type ApprovalDecision,
@@ -71,6 +72,10 @@ export interface TeamSettings {
   autoSafetyCheck?: boolean;
   /** For the context meter (default 1_000_000). */
   contextWindow?: number;
+  /** Unsloth Desktop: available models ("local:<id>"), its base URL, and whether its key is saved. */
+  localModels?: string[];
+  localServer?: string;
+  hasLocalKey?: boolean;
 }
 
 export interface TeamOptions {
@@ -153,6 +158,10 @@ export class Team implements TeamContext {
     return [...this.slots.values()].map((s) => this.decorate(s, s.handle.info()));
   }
 
+  availableModels(): string[] {
+    return [...MODELS, ...(this.opts.settings().localModels ?? [])];
+  }
+
   takeAutoTurn(_agent: string): boolean {
     // All limits are optional: 0 (the default) means unlimited.
     if (!(this.opts.settings().maxAutoTurns > 0)) return true;
@@ -210,8 +219,8 @@ export class Team implements TeamContext {
     }
     const role = (input.role ?? "").trim();
     if (!role) throw new TeamError("A teammate needs a role.");
-    if (input.model !== undefined && !(MODELS as readonly string[]).includes(input.model)) {
-      throw new TeamError(`Unknown model "${input.model}". Choose one of: ${MODELS.join(", ")}.`);
+    if (input.model !== undefined && !isKnownModel(input.model)) {
+      throw new TeamError(`Unknown model "${input.model}". Choose one of: ${MODELS.join(", ")}, or a local model as "local:<id>" (see team_roster or the model picker).`);
     }
     if (input.effort !== undefined && !EFFORTS.includes(input.effort)) {
       throw new TeamError(`Unknown effort "${String(input.effort)}". Choose one of: ${EFFORTS.join(", ")}.`);
@@ -289,6 +298,9 @@ export class Team implements TeamContext {
       maxAutoTurns: s.maxAutoTurns,
       teamOutputTokens: this.teamOutputTokens,
       maxTeamOutputTokens: s.maxTeamOutputTokens,
+      localModels: s.localModels ?? [],
+      localServer: s.localServer,
+      hasLocalKey: s.hasLocalKey ?? false,
     };
   }
 
@@ -363,7 +375,7 @@ export class Team implements TeamContext {
 
   setAgentModel(agent: string, model: string): void {
     const s = this.slots.get(agent);
-    if (!s || s.removed || !(MODELS as readonly string[]).includes(model)) return;
+    if (!s || s.removed || !isKnownModel(model)) return;
     s.handle.setModel(model);
   }
 

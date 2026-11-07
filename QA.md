@@ -210,3 +210,15 @@ Ultra approves every edit and command with NO safety check, except a short list 
 - Agents cannot message the user; their reply is in their own chat (unread badge).
 - An approved `write_file` can overwrite changes made by another agent after approval; `edit_file` fails safely.
 - Budgets are off by default; when switched on they protect against runaway spend but are not exact prices.
+
+## 22. Local models (Unsloth Desktop)
+1. In Unsloth Desktop: load a model that supports tool calling, then Settings → API → create a key (`sk-unsloth-…`). Note the URL/port it prints (often `http://localhost:8888`).
+2. If the port isn't 8888, set `nextAgent.local.baseUrl` (no `/v1`). Run **NextAgent: Set Local Model Key (Unsloth)** and paste the key. **A toast says how many local models were found.**
+3. Open the model picker in the composer. **Local models appear after the Claude models as `<id> · local`, loaded ones first.** Pick one for main and ask it to list the files. **It streams a reply and uses read/list tools; no thinking blocks appear.**
+4. Switch main back to a Claude model mid-chat. **The next turn uses Claude.** Add a teammate with a local model from the Add teammate dialog. **It works on its prompt and messages main.**
+5. Ask main (on Claude) to spawn a teammate "on one of the local models". **team_roster lists the local models and main spawns one by `local:<id>`.**
+6. Switch to Plan mode while on a local model. **The agent still gets the mode note (sent as text) and edits are refused.**
+7. Auto mode with no Claude key set (Clear API Key): run something that needs the safety check (e.g. `npm install`). **The local model judges it; an unclear answer asks you.** With a Claude key set, Haiku is used instead.
+8. Stop Unsloth Desktop and send a message to a local agent. **A clear "Can't reach Unsloth Desktop…" notice appears.** Clear the local key and send again. **"No Unsloth API key found…".**
+9. Run **NextAgent: Refresh Local Models** after loading another model in Unsloth. **It appears in the picker.**
+- Known limits: tool use, planning and team coordination depend on how well the local model handles tool calling. If Unsloth's own server-side tools are on, they can swallow tool calls; NextAgent sends `enable_tools: false`, and Unsloth's docs suggest `--disable-tools` when launching from the command line.

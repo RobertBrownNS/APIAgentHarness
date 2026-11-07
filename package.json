@@ -51,6 +51,21 @@
         "command": "nextAgent.setMode",
         "title": "Set Mode",
         "category": "NextAgent"
+      },
+      {
+        "command": "nextAgent.setLocalApiKey",
+        "title": "Set Local Model Key (Unsloth)",
+        "category": "NextAgent"
+      },
+      {
+        "command": "nextAgent.clearLocalApiKey",
+        "title": "Clear Local Model Key (Unsloth)",
+        "category": "NextAgent"
+      },
+      {
+        "command": "nextAgent.refreshLocalModels",
+        "title": "Refresh Local Models",
+        "category": "NextAgent"
       }
     ],
     "configuration": {
@@ -145,6 +160,24 @@
           "default": "claude-haiku-5-5",
           "description": "Model used for the Auto mode safety check.",
           "scope": "machine"
+        },
+        "nextAgent.local.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8888",
+          "scope": "machine",
+          "description": "Unsloth Desktop server address (its Anthropic-compatible API). Use the URL and port Unsloth prints, without /v1."
+        },
+        "nextAgent.local.maxTokens": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 256,
+          "description": "Maximum output tokens per response for local models."
+        },
+        "nextAgent.local.safetyModel": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Local model id for Auto mode's safety check when no Claude key is set. Empty = the first loaded Unsloth model."
         }
       }
     }

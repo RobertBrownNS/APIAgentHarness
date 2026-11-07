@@ -148,6 +148,8 @@ export interface TeamContext {
     /** tool_use id: lets Team refuse a call Auto approved once the mode is no longer Auto. */
     callId?: string,
   ): { ok: true } | { ok: false; reason: string; blockedByMode: Mode };
+  /** Model ids a teammate can be given: Claude models plus Unsloth "local:<id>" models (shown by team_roster). */
+  availableModels?(): string[];
   /** Called by loop after a successful edit_file/write_file so autoPolicy can apply the written-file rule. */
   recordWrite(agent: string, absPath: string): void;
   /**
